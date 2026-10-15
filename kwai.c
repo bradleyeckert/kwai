@@ -36,6 +36,9 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/time.h>
+#include <glob.h>
+#include <dirent.h>
+#include <limits.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -641,6 +644,95 @@ static int read_line(char* line, int size) {
 #endif
 
 /* ======================================================================
+ * Listing the serial ports
+ *
+ * Windows: the registry's HARDWARE\DEVICEMAP\SERIALCOMM, which maps each
+ * driver device to its COM name (a USB CDC port, like the LiteForth
+ * board's, is \Device\USBSERnnn). Linux: /dev/serial/by-id (names with
+ * the maker, product and serial number) and the ttyACM, ttyUSB and ttyAMA
+ * devices. macOS: /dev/cu.*.
+ */
+#ifdef KWAI_WINDOWS
+#ifdef _MSC_VER
+#pragma comment(lib, "advapi32.lib")
+#endif
+typedef struct { int num; char com[64]; char dev[200]; } com_t;
+
+static int com_order(const void* a, const void* b) {
+    return ((const com_t*)a)->num - ((const com_t*)b)->num;
+}
+
+static int list_ports(void) {
+    HKEY key;
+    com_t ports[256];
+    int n = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        for (DWORD i = 0; n < 256; i++) {
+            char dev[200];
+            BYTE com[64];
+            DWORD ndev = sizeof dev, ncom = sizeof com - 1, type;
+            if (RegEnumValueA(key, i, dev, &ndev, NULL, &type, com, &ncom) != ERROR_SUCCESS) break;
+            if (type != REG_SZ) continue;
+            com[ncom] = 0;
+            snprintf(ports[n].com, sizeof ports[n].com, "%s", (char*)com);
+            snprintf(ports[n].dev, sizeof ports[n].dev, "%s", dev);
+            ports[n].num = atoi(ports[n].com + (strncmp(ports[n].com, "COM", 3) ? 0 : 3));
+            n++;
+        }
+        RegCloseKey(key);
+    }
+    qsort(ports, (size_t)n, sizeof ports[0], com_order);
+    for (int i = 0; i < n; i++) {
+        printf("  %-8s %s%s\n", ports[i].com, ports[i].dev,
+               strstr(ports[i].dev, "USBSER") ? "  (USB CDC)" : "");
+    }
+    if (n == 0) printf("  no serial ports\n");
+    fflush(stdout);
+    return n;
+}
+#else
+static int list_ports(void) {
+    int n = 0;
+    char shown[64][PATH_MAX];
+    int nshown = 0;
+    DIR* d = opendir("/dev/serial/by-id");
+    if (d) {
+        struct dirent* e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char link[PATH_MAX + 32], target[PATH_MAX], real[PATH_MAX + 8];
+            snprintf(link, sizeof link, "/dev/serial/by-id/%s", e->d_name);
+            ssize_t len = readlink(link, target, sizeof target - 1);
+            if (len <= 0) continue;
+            target[len] = 0;
+            const char* base = strrchr(target, '/');    /* udev: ../../ttyACM0 */
+            snprintf(real, sizeof real, "/dev/%s", base ? base + 1 : target);
+            printf("  %-16s %s\n", real, e->d_name);
+            if (nshown < 64) snprintf(shown[nshown++], sizeof shown[0], "%.*s", PATH_MAX - 1, real);
+            n++;
+        }
+        closedir(d);
+    }
+    static const char* patterns[] = { "/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyAMA*", "/dev/cu.*" };
+    for (size_t p = 0; p < sizeof patterns / sizeof patterns[0]; p++) {
+        glob_t g;
+        if (glob(patterns[p], 0, NULL, &g) != 0) continue;
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            int dup = 0;
+            for (int k = 0; k < nshown; k++) if (!strcmp(shown[k], g.gl_pathv[i])) dup = 1;
+            if (dup) continue;
+            printf("  %s\n", g.gl_pathv[i]);
+            n++;
+        }
+        globfree(&g);
+    }
+    if (n == 0) printf("  no serial ports (ttyACM, ttyUSB, ttyAMA, cu.*)\n");
+    fflush(stdout);
+    return n;
+}
+#endif
+
+/* ======================================================================
  * Commands and the main loop
  */
 static const char* eol = "\n";
@@ -650,6 +742,7 @@ static void help(void) {
          "  ~x FILE   type `xmodem` on the board, then send FILE by XMODEM\n"
          "  ~s FILE   send FILE by XMODEM to a receiver that is already waiting\n"
          "  ~r        send Ctrl+X three times (restarts a LiteForth CH32H417 without its app)\n"
+         "  ~l        list the serial ports\n"
          "  ~~TEXT    send ~TEXT\n"
          "  ~?        this list\n"
          "  ~q        quit (so does Ctrl+C)",
@@ -670,6 +763,11 @@ static int command(const char* line) {
         send_bytes(eol, (int)strlen(eol));
     } else if (c == 'q' || c == 'Q') {
         return 1;
+    } else if (c == 'l' || c == 'L') {
+        lock(&out_lock);
+        printf("\n");
+        list_ports();
+        unlock(&out_lock);
     } else if (c == 'r' || c == 'R') {
         static const unsigned char x3[3] = { 0x18, 0x18, 0x18 };
         if (send_bytes(x3, 3)) note("not connected");
@@ -692,6 +790,7 @@ static void usage(void) {
     fprintf(stderr,
         "kwai " KWAI_VERSION ": a line-mode terminal for a serial port\n"
         "usage: kwai [-b baud] [--crlf] PORT     (COM15, /dev/ttyACM0, ...)\n"
+        "       kwai -l                          list the serial ports\n"
         "  -b baud   bits per second (default 115200; USB CDC ignores it)\n"
         "  --crlf    end lines with CR LF instead of LF\n");
 }
@@ -700,10 +799,17 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-b") && i + 1 < argc) port_baud = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--crlf")) eol = "\r\n";
+        else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--list")) { list_ports(); return 0; }
         else if (argv[i][0] == '-') { usage(); return 2; }
         else snprintf(port_name, sizeof port_name, "%s", argv[i]);
     }
-    if (!port_name[0] || port_baud <= 0) { usage(); return 2; }
+    if (!port_name[0] || port_baud <= 0) {
+        usage();
+        fprintf(stderr, "serial ports:\n");
+        fflush(stderr);
+        list_ports();
+        return 2;
+    }
 
     console_init();
     lock_init(&out_lock);

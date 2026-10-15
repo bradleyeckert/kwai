@@ -23,7 +23,21 @@ Like a console app on your desktop, they take input a line at a time and don't e
 kwai COM15                  Windows
 rlwrap kwai /dev/ttyACM0    Linux, with rlwrap for line history
 kwai -b 9600 /dev/ttyUSB0   a UART at 9600 baud
+kwai -l                     list the serial ports
 ```
+
+`kwai -l` (or `kwai` with no port) lists the ports there are. On Windows
+it shows each COM port with the driver device behind it; a USB CDC port,
+such as a LiteForth CH32H417 board's, is marked `(USB CDC)`:
+
+```
+  COM3     \Device\Serial0
+  COM15    \Device\USBSER000  (USB CDC)
+```
+
+On Linux it shows `/dev/serial/by-id` names next to their devices (the maker
+and product, which tell boards apart), then any other `ttyACM`, `ttyUSB` or
+`ttyAMA` devices; on macOS, the `/dev/cu.*` devices.
 
 | Option | Meaning |
 |---|---|
@@ -39,6 +53,7 @@ Lines that start with `~` are for kwai:
 |---|---|
 | `~x FILE` | Types `xmodem` on the board, then sends FILE by XMODEM |
 | `~s FILE` | Sends FILE by XMODEM to a receiver that is already waiting |
+| `~l` | Lists the serial ports |
 | `~r` | Sends Ctrl+X three times: restarts a LiteForth CH32H417 without starting its app |
 | `~~TEXT` | Sends `~TEXT` |
 | `~?` | Lists these |
