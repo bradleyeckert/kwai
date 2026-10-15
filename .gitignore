@@ -1,0 +1,8 @@
+kwai
+kwai.exe
+*.obj
+*.o
+build/
+out/
+.vs/
+__pycache__/
