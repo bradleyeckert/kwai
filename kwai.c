@@ -17,7 +17,9 @@
  */
 #if defined(_WIN32) || defined(_WIN64)
 #define KWAI_WINDOWS 1
-#define _CRT_SECURE_NO_WARNINGS
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS     /* fopen, ... (build.bat also defines it) */
+#endif
 #if !defined(_WIN32_WINNT) || (_WIN32_WINNT < 0x0600)
 #undef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600         /* condition variables */
