@@ -651,11 +651,165 @@ static int read_line(char* line, int size) {
  * board's, is \Device\USBSERnnn). Linux: /dev/serial/by-id (names with
  * the maker, product and serial number) and the ttyACM, ttyUSB and ttyAMA
  * devices. macOS: /dev/cu.*.
+ *
+ * A USB port gets a second line with its VID:PID and the device
+ * descriptor's Manufacturer, Product and Serial Number strings (from the
+ * hub on Windows, from sysfs on Linux).
  */
+typedef struct {
+    int vid, pid;               /* -1: not a USB device */
+    char man[128], prod[128], serial[128];
+} usb_info_t;
+
+/* Prints a USB port's second line: VID:PID and the descriptor strings */
+static void show_usb(const usb_info_t* u, int indent) {
+    if (u->vid < 0) return;
+    printf("%*sUSB %04x:%04x", indent, "", u->vid, u->pid);
+    if (u->man[0]) printf(", manufacturer \"%s\"", u->man);
+    if (u->prod[0]) printf(", product \"%s\"", u->prod);
+    if (u->serial[0]) printf(", serial \"%s\"", u->serial);
+    printf("\n");
+}
+
 #ifdef KWAI_WINDOWS
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 #endif
+#include <setupapi.h>
+#include <cfgmgr32.h>
+
+/* USB descriptor strings. Windows keeps only some of them (the serial
+ * number, when there is one, as the last part of the device ID), so kwai
+ * does what USBView does: it finds the hub port the device is plugged
+ * into and asks the hub for the descriptors. That doesn't disturb the
+ * device or need administrator rights. The GUIDs and the IOCTL are spelled
+ * out so no DDK header is needed. */
+static const GUID kwai_guid_ports =     /* GUID_DEVCLASS_PORTS */
+    { 0x4d36e978, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+static const GUID kwai_guid_usb_hub =   /* GUID_DEVINTERFACE_USB_HUB */
+    { 0xf18a0e88, 0xc30c, 0x11d0, { 0x88, 0x15, 0x00, 0xa0, 0xc9, 0x06, 0xbe, 0xd8 } };
+#define KWAI_IOCTL_USB_GET_DESCRIPTOR 0x220410  /* IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION */
+#define KWAI_DESC_REQ 12        /* USB_DESCRIPTOR_REQUEST: port (4), setup packet (8) */
+
+/* Asks the hub for descriptor (type, index) of the device on port. Returns
+ * its length, 0 if it fails. */
+static int hub_descriptor(HANDLE hub, ULONG port, int type, int index, int lang,
+                          unsigned char* out, int max) {
+    unsigned char buf[KWAI_DESC_REQ + 255];
+    DWORD got = 0;
+    if (max > 255) max = 255;
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, &port, 4);
+    buf[4] = 0x80;                          /* device to host, standard */
+    buf[5] = 6;                             /* GET_DESCRIPTOR */
+    buf[6] = (unsigned char)index;          /* wValue: type << 8 | index */
+    buf[7] = (unsigned char)type;
+    buf[8] = (unsigned char)lang;           /* wIndex: language ID */
+    buf[9] = (unsigned char)(lang >> 8);
+    buf[10] = (unsigned char)max;           /* wLength */
+    buf[11] = 0;
+    if (!DeviceIoControl(hub, KWAI_IOCTL_USB_GET_DESCRIPTOR, buf, KWAI_DESC_REQ + (DWORD)max,
+                         buf, KWAI_DESC_REQ + (DWORD)max, &got, NULL)) return 0;
+    if (got <= KWAI_DESC_REQ + 2 || buf[KWAI_DESC_REQ + 1] != type) return 0;
+    int n = (int)got - KWAI_DESC_REQ;
+    if (buf[KWAI_DESC_REQ] < n) n = buf[KWAI_DESC_REQ];   /* bLength */
+    memcpy(out, buf + KWAI_DESC_REQ, (size_t)n);
+    return n;
+}
+
+/* String descriptor index as UTF-8 in out ("" if there is none) */
+static void hub_string(HANDLE hub, ULONG port, int index, int lang, char* out, int max) {
+    unsigned char d[255];
+    wchar_t w[128];
+    out[0] = 0;
+    if (index == 0) return;
+    int n = hub_descriptor(hub, port, 3, index, lang, d, (int)sizeof d);
+    int nw = n > 2 ? (n - 2) / 2 : 0;
+    for (int i = 0; i < nw; i++) w[i] = (wchar_t)(d[2 + 2 * i] | d[3 + 2 * i] << 8);
+    int len = nw ? WideCharToMultiByte(CP_UTF8, 0, w, nw, out, max - 1, NULL, NULL) : 0;
+    out[len > 0 ? len : 0] = 0;
+}
+
+/* Fills info from the hub the USB device dev is plugged into */
+static void usb_from_hub(DEVINST dev, usb_info_t* info) {
+    ULONG port = 0, size = sizeof port;
+    DEVINST hubdev;
+    char hubid[MAX_DEVICE_ID_LEN];
+    if (CM_Get_DevNode_Registry_PropertyA(dev, CM_DRP_ADDRESS, NULL, &port, &size, 0) != CR_SUCCESS
+        || CM_Get_Parent(&hubdev, dev, 0) != CR_SUCCESS
+        || CM_Get_Device_IDA(hubdev, hubid, sizeof hubid, 0) != CR_SUCCESS) return;
+    ULONG len = 0;
+    if (CM_Get_Device_Interface_List_SizeA(&len, (LPGUID)&kwai_guid_usb_hub, hubid,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS || len < 2) return;
+    char* paths = (char*)malloc(len);
+    if (!paths) return;
+    if (CM_Get_Device_Interface_ListA((LPGUID)&kwai_guid_usb_hub, hubid, paths, len,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT) == CR_SUCCESS && paths[0]) {
+        HANDLE hub = CreateFileA(paths, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (hub != INVALID_HANDLE_VALUE) {
+            unsigned char d[18], langs[255];
+            if (hub_descriptor(hub, port, 1, 0, 0, d, (int)sizeof d) >= 18) {
+                int lang = 0x0409;
+                if (hub_descriptor(hub, port, 3, 0, 0, langs, (int)sizeof langs) >= 4)
+                    lang = langs[2] | langs[3] << 8;        /* the first language */
+                info->vid = d[8] | d[9] << 8;
+                info->pid = d[10] | d[11] << 8;
+                hub_string(hub, port, d[14], lang, info->man, (int)sizeof info->man);
+                hub_string(hub, port, d[15], lang, info->prod, (int)sizeof info->prod);
+                hub_string(hub, port, d[16], lang, info->serial, (int)sizeof info->serial);
+            }
+            CloseHandle(hub);
+        }
+    }
+    free(paths);
+}
+
+/* USB details of COM port com, from the device ID (VID, PID, serial) and
+ * then from the hub. info->vid < 0 if it isn't a USB device. */
+static void usb_info(const char* com, usb_info_t* info) {
+    memset(info, 0, sizeof *info);
+    info->vid = -1;
+    HDEVINFO set = SetupDiGetClassDevsA(&kwai_guid_ports, NULL, NULL, DIGCF_PRESENT);
+    if (set == INVALID_HANDLE_VALUE) return;
+    SP_DEVINFO_DATA dd;
+    dd.cbSize = sizeof dd;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &dd); i++) {
+        char name[64];
+        DWORD n = sizeof name - 1, type;
+        HKEY key = SetupDiOpenDevRegKey(set, &dd, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+        if (key == INVALID_HANDLE_VALUE) continue;
+        LONG r = RegQueryValueExA(key, "PortName", NULL, &type, (BYTE*)name, &n);
+        RegCloseKey(key);
+        if (r != ERROR_SUCCESS || type != REG_SZ) continue;
+        name[n] = 0;
+        if (_stricmp(name, com)) continue;
+        /* Walk up to the USB device: USB\VID_1A86&PID_FE0C\serial. A port
+         * of a composite device hangs off an interface (...&MI_00\...). */
+        DEVINST dev = dd.DevInst;
+        for (int up = 0; up < 4; up++) {
+            char id[MAX_DEVICE_ID_LEN];
+            if (CM_Get_Device_IDA(dev, id, sizeof id, 0) != CR_SUCCESS) break;
+            if (!_strnicmp(id, "USB\\", 4) && !strstr(id, "&MI_")) {
+                unsigned vid, pid;
+                if (sscanf(id + 4, "VID_%4x&PID_%4x", &vid, &pid) == 2) {
+                    const char* sn = strchr(id + 4, '\\');
+                    info->vid = (int)vid;
+                    info->pid = (int)pid;
+                    if (sn && !strchr(sn, '&'))     /* Windows made up IDs with & */
+                        snprintf(info->serial, sizeof info->serial, "%s", sn + 1);
+                    usb_from_hub(dev, info);
+                }
+                break;
+            }
+            if (CM_Get_Parent(&dev, dev, 0) != CR_SUCCESS) break;
+        }
+        break;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+}
+
 typedef struct { int num; char com[64]; char dev[200]; } com_t;
 
 static int com_order(const void* a, const void* b) {
@@ -685,14 +839,58 @@ static int list_ports(void) {
     for (int i = 0; i < n; i++) {
         printf("  %-8s %s%s\n", ports[i].com, ports[i].dev,
                strstr(ports[i].dev, "USBSER") ? "  (USB CDC)" : "");
+        usb_info_t u;
+        usb_info(ports[i].com, &u);
+        show_usb(&u, 11);
     }
     if (n == 0) printf("  no serial ports\n");
     fflush(stdout);
     return n;
 }
 #else
+/* Reads the first line of file dir/name into out ("" if there is none) */
+static void read_line_file(const char* dir, const char* name, char* out, int max) {
+    char path[PATH_MAX + 64];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    out[0] = 0;
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    if (!fgets(out, max, f)) out[0] = 0;
+    fclose(f);
+    out[strcspn(out, "\r\n")] = 0;
+}
+
+/* USB details of tty dev (/dev/ttyACM0) from sysfs: the USB device is the
+ * first directory above /sys/class/tty/ttyACM0/device with an idVendor.
+ * KWAI_SYSFS replaces /sys (for testing). */
+static void usb_info(const char* dev, usb_info_t* info) {
+    char path[PATH_MAX + 64], dir[PATH_MAX], hex[16];
+    const char* sys = getenv("KWAI_SYSFS");
+    const char* base = strrchr(dev, '/');
+    memset(info, 0, sizeof *info);
+    info->vid = -1;
+    snprintf(path, sizeof path, "%s/class/tty/%s/device", sys ? sys : "/sys", base ? base + 1 : dev);
+    if (!realpath(path, dir)) return;
+    for (int up = 0; up < 4; up++) {
+        read_line_file(dir, "idVendor", hex, (int)sizeof hex);
+        if (hex[0]) {
+            info->vid = (int)strtol(hex, NULL, 16);
+            read_line_file(dir, "idProduct", hex, (int)sizeof hex);
+            info->pid = (int)strtol(hex, NULL, 16);
+            read_line_file(dir, "manufacturer", info->man, (int)sizeof info->man);
+            read_line_file(dir, "product", info->prod, (int)sizeof info->prod);
+            read_line_file(dir, "serial", info->serial, (int)sizeof info->serial);
+            return;
+        }
+        char* slash = strrchr(dir, '/');
+        if (!slash || slash == dir) return;
+        *slash = 0;
+    }
+}
+
 static int list_ports(void) {
     int n = 0;
+    usb_info_t u;
     char shown[64][PATH_MAX];
     int nshown = 0;
     DIR* d = opendir("/dev/serial/by-id");
@@ -708,6 +906,8 @@ static int list_ports(void) {
             const char* base = strrchr(target, '/');    /* udev: ../../ttyACM0 */
             snprintf(real, sizeof real, "/dev/%s", base ? base + 1 : target);
             printf("  %-16s %s\n", real, e->d_name);
+            usb_info(real, &u);
+            show_usb(&u, 19);
             if (nshown < 64) snprintf(shown[nshown++], sizeof shown[0], "%.*s", PATH_MAX - 1, real);
             n++;
         }
@@ -722,6 +922,8 @@ static int list_ports(void) {
             for (int k = 0; k < nshown; k++) if (!strcmp(shown[k], g.gl_pathv[i])) dup = 1;
             if (dup) continue;
             printf("  %s\n", g.gl_pathv[i]);
+            usb_info(g.gl_pathv[i], &u);
+            show_usb(&u, 4);
             n++;
         }
         globfree(&g);
@@ -796,6 +998,7 @@ static void usage(void) {
 }
 
 int main(int argc, char** argv) {
+    console_init();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-b") && i + 1 < argc) port_baud = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--crlf")) eol = "\r\n";
@@ -811,7 +1014,6 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    console_init();
     lock_init(&out_lock);
     lock_init(&port_lock);
     lock_init(&rxq_lock);

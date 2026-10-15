@@ -28,16 +28,25 @@ kwai -l                     list the serial ports
 
 `kwai -l` (or `kwai` with no port) lists the ports there are. On Windows
 it shows each COM port with the driver device behind it; a USB CDC port,
-such as a LiteForth CH32H417 board's, is marked `(USB CDC)`:
+such as a LiteForth CH32H417 board's, is marked `(USB CDC)`. A USB port
+gets a second line with its vendor and product IDs and the strings from
+its device descriptor (Manufacturer, Product and Serial Number), which
+tell two boards, or a board and its debug probe, apart:
 
 ```
   COM3     \Device\Serial0
-  COM15    \Device\USBSER000  (USB CDC)
+  COM15    \Device\USBSER001  (USB CDC)
+           USB vvvv:pppp, manufacturer "...", product "...", serial "..."
 ```
+
+Windows doesn't keep all of these strings, so kwai asks the USB hub the
+device is plugged into for them, as Microsoft's USBView does (no
+administrator rights needed). On Linux they come from sysfs.
 
 On Linux it shows `/dev/serial/by-id` names next to their devices (the maker
 and product, which tell boards apart), then any other `ttyACM`, `ttyUSB` or
-`ttyAMA` devices; on macOS, the `/dev/cu.*` devices.
+`ttyAMA` devices, each with its USB line; on macOS, the `/dev/cu.*`
+devices.
 
 | Option | Meaning |
 |---|---|
@@ -84,7 +93,7 @@ it goes.
 | Visual Studio 2022 | *File > Open > Folder* on this folder (it uses `CMakeLists.txt`), or `build.bat` in a Developer Command Prompt |
 
 It is one C file, `kwai.c`, with no dependencies beyond the C library,
-Win32 or POSIX threads.
+Win32 (with SetupAPI and CfgMgr32, for the USB strings) or POSIX threads.
 
 ## Testing
 

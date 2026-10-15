@@ -6,7 +6,7 @@ CFLAGS ?= -Wall -Wextra -O2
 
 ifeq ($(OS),Windows_NT)
 EXE  = kwai.exe
-LIBS =
+LIBS = -lsetupapi -lcfgmgr32
 else
 EXE  = kwai
 LIBS = -pthread
