@@ -23,7 +23,7 @@ input a line at a time and don't echo it:
 
 ```
 kwai COM15                  Windows
-kwai /dev/ttyACM0           Linux
+rlwrap kwai /dev/ttyACM0    Linux, with rlwrap for line history
 kwai -b 9600 /dev/ttyUSB0   a UART at 9600 baud
 ```
 
