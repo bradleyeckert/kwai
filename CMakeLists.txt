@@ -1,0 +1,12 @@
+# For Visual Studio 2022: File > Open > Folder, then build kwai.exe.
+cmake_minimum_required(VERSION 3.10)
+project(kwai C)
+add_executable(kwai kwai.c)
+if(MSVC)
+    target_compile_options(kwai PRIVATE /W4)
+    target_compile_definitions(kwai PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(kwai PRIVATE -Wall -Wextra)
+    find_package(Threads REQUIRED)
+    target_link_libraries(kwai PRIVATE Threads::Threads)
+endif()
