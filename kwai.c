@@ -693,15 +693,15 @@ static const GUID kwai_guid_usb_hub =   /* GUID_DEVINTERFACE_USB_HUB */
 #define KWAI_IOCTL_USB_GET_DESCRIPTOR 0x220410  /* IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION */
 #define KWAI_DESC_REQ 12        /* USB_DESCRIPTOR_REQUEST: port (4), setup packet (8) */
 
-/* Asks the hub for descriptor (type, index) of the device on port. Returns
+/* Asks the hub for descriptor (type, index) of the device on hub port hubport. Returns
  * its length, 0 if it fails. */
-static int hub_descriptor(HANDLE hub, ULONG port, int type, int index, int lang,
+static int hub_descriptor(HANDLE hub, ULONG hubport, int type, int index, int lang,
                           unsigned char* out, int max) {
     unsigned char buf[KWAI_DESC_REQ + 255];
     DWORD got = 0;
     if (max > 255) max = 255;
     memset(buf, 0, sizeof buf);
-    memcpy(buf, &port, 4);
+    memcpy(buf, &hubport, 4);
     buf[4] = 0x80;                          /* device to host, standard */
     buf[5] = 6;                             /* GET_DESCRIPTOR */
     buf[6] = (unsigned char)index;          /* wValue: type << 8 | index */
@@ -720,12 +720,12 @@ static int hub_descriptor(HANDLE hub, ULONG port, int type, int index, int lang,
 }
 
 /* String descriptor index as UTF-8 in out ("" if there is none) */
-static void hub_string(HANDLE hub, ULONG port, int index, int lang, char* out, int max) {
+static void hub_string(HANDLE hub, ULONG hubport, int index, int lang, char* out, int max) {
     unsigned char d[255];
     wchar_t w[128];
     out[0] = 0;
     if (index == 0) return;
-    int n = hub_descriptor(hub, port, 3, index, lang, d, (int)sizeof d);
+    int n = hub_descriptor(hub, hubport, 3, index, lang, d, (int)sizeof d);
     int nw = n > 2 ? (n - 2) / 2 : 0;
     for (int i = 0; i < nw; i++) w[i] = (wchar_t)(d[2 + 2 * i] | d[3 + 2 * i] << 8);
     int len = nw ? WideCharToMultiByte(CP_UTF8, 0, w, nw, out, max - 1, NULL, NULL) : 0;
@@ -734,10 +734,10 @@ static void hub_string(HANDLE hub, ULONG port, int index, int lang, char* out, i
 
 /* Fills info from the hub the USB device dev is plugged into */
 static void usb_from_hub(DEVINST dev, usb_info_t* info) {
-    ULONG port = 0, size = sizeof port;
+    ULONG hubport = 0, size = sizeof hubport;
     DEVINST hubdev;
     char hubid[MAX_DEVICE_ID_LEN];
-    if (CM_Get_DevNode_Registry_PropertyA(dev, CM_DRP_ADDRESS, NULL, &port, &size, 0) != CR_SUCCESS
+    if (CM_Get_DevNode_Registry_PropertyA(dev, CM_DRP_ADDRESS, NULL, &hubport, &size, 0) != CR_SUCCESS
         || CM_Get_Parent(&hubdev, dev, 0) != CR_SUCCESS
         || CM_Get_Device_IDA(hubdev, hubid, sizeof hubid, 0) != CR_SUCCESS) return;
     ULONG len = 0;
@@ -750,15 +750,15 @@ static void usb_from_hub(DEVINST dev, usb_info_t* info) {
         HANDLE hub = CreateFileA(paths, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (hub != INVALID_HANDLE_VALUE) {
             unsigned char d[18], langs[255];
-            if (hub_descriptor(hub, port, 1, 0, 0, d, (int)sizeof d) >= 18) {
+            if (hub_descriptor(hub, hubport, 1, 0, 0, d, (int)sizeof d) >= 18) {
                 int lang = 0x0409;
-                if (hub_descriptor(hub, port, 3, 0, 0, langs, (int)sizeof langs) >= 4)
+                if (hub_descriptor(hub, hubport, 3, 0, 0, langs, (int)sizeof langs) >= 4)
                     lang = langs[2] | langs[3] << 8;        /* the first language */
                 info->vid = d[8] | d[9] << 8;
                 info->pid = d[10] | d[11] << 8;
-                hub_string(hub, port, d[14], lang, info->man, (int)sizeof info->man);
-                hub_string(hub, port, d[15], lang, info->prod, (int)sizeof info->prod);
-                hub_string(hub, port, d[16], lang, info->serial, (int)sizeof info->serial);
+                hub_string(hub, hubport, d[14], lang, info->man, (int)sizeof info->man);
+                hub_string(hub, hubport, d[15], lang, info->prod, (int)sizeof info->prod);
+                hub_string(hub, hubport, d[16], lang, info->serial, (int)sizeof info->serial);
             }
             CloseHandle(hub);
         }
