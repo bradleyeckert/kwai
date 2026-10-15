@@ -1,13 +1,14 @@
 /*
  * kwai: a line-mode terminal for a serial port, made for LiteForth boards.
  *
- *   kwai [-b baud] [--crlf] PORT          e.g. kwai COM15, kwai /dev/ttyACM0
+ *   kwai [-b baud] [-p ms] [--crlf] PORT  e.g. kwai COM15, kwai /dev/ttyACM0
  *
  * The console stays in its normal (cooked) line mode, so it does the
  * editing, echo and history (the up arrow, on Windows); each line typed is
- * sent to the port when Enter is pressed, ending in LF. A reader thread
- * prints what the port sends. Lines that start with ~ are commands for
- * kwai itself (~? lists them), including an XMODEM send.
+ * sent to the port when Enter is pressed, ending in LF; a pasted block goes
+ * a line at a time, each after the board's `ok>` for the last (or 100 ms).
+ * A reader thread prints what the port sends. Lines that start with ~ are
+ * commands for kwai itself (~? lists them), including an XMODEM send.
  *
  * If the port goes away (a USB CDC device re-enumerating after a reflash),
  * kwai says so and reopens it as soon as it comes back. It also waits for
@@ -159,12 +160,15 @@ static int utf8_tail(const unsigned char* p, int n) {
     return 0;
 }
 
+static void prompt_scan(const unsigned char* p, int n);
+
 /* Writes port output to stdout. Call with out_lock held. */
 static void out_bytes(const unsigned char* p, int n) {
     static unsigned char carry[4];
     static int ncarry;
     unsigned char buf[4096 + 4];
     if (n > 4096) n = 4096;
+    prompt_scan(p, n);
     memcpy(buf, carry, (size_t)ncarry);
     memcpy(buf + ncarry, p, (size_t)n);
     int total = ncarry + n;
@@ -441,6 +445,68 @@ static int send_bytes(const void* p, int n) {
         if (r) port_broken = 1;                     /* the reader reopens it */
     }
     unlock(&port_lock);
+    return r;
+}
+
+/* ======================================================================
+ * Pacing lines
+ *
+ * A pasted block arrives as lines faster than the board can take them, so
+ * before sending a line kwai waits for the previous one's `ok>` prompt,
+ * but no longer than pace_ms after it was sent (a line that ends in an
+ * error, or a board that doesn't prompt, gets no `ok>`). A line typed by
+ * hand comes long after that, so it isn't held up. -p 0 turns this off.
+ */
+static const char* eol = "\n";        /* --crlf: "\r\n" */
+static int pace_ms = 100;
+static lock_t prompt_lock;
+static cond_t prompt_cond;
+static int prompt_seen;                 /* `ok>` came since the last line */
+static int prompt_awaited;              /* a line was sent: wait for it */
+static uint64_t line_sent_ms;
+
+/* Watches port output for `ok>`. Called from out_bytes, so the text is
+ * caught even across reads. */
+static void prompt_scan(const unsigned char* p, int n) {
+    static const char ok[] = "ok>";
+    static int match;
+    int seen = 0;
+    for (int i = 0; i < n; i++) {
+        if (p[i] == (unsigned char)ok[match]) match++;
+        else match = (p[i] == (unsigned char)ok[0]);
+        if (match == 3) { seen = 1; match = 0; }
+    }
+    if (seen) {
+        lock(&prompt_lock);
+        prompt_seen = 1;
+        cond_signal(&prompt_cond);
+        unlock(&prompt_lock);
+    }
+}
+
+/* Sends a line and its line end, after the previous line's `ok>` (or
+ * pace_ms). Returns 0, or -1 if it isn't connected. */
+static int send_line(const char* text) {
+    lock(&prompt_lock);
+    if (prompt_awaited && pace_ms > 0) {
+        uint64_t end = line_sent_ms + (uint64_t)pace_ms;
+        for (;;) {
+            uint64_t t = now_ms();
+            if (prompt_seen || t >= end || !connected) break;
+            cond_wait_ms(&prompt_cond, &prompt_lock, (int)(end - t));
+        }
+    }
+    prompt_seen = 0;
+    prompt_awaited = 0;
+    unlock(&prompt_lock);
+    int r = send_bytes(text, (int)strlen(text));
+    if (r == 0) r = send_bytes(eol, (int)strlen(eol));
+    if (r == 0) {
+        lock(&prompt_lock);
+        prompt_awaited = 1;
+        line_sent_ms = now_ms();
+        unlock(&prompt_lock);
+    }
     return r;
 }
 
@@ -937,7 +1003,6 @@ static int list_ports(void) {
 /* ======================================================================
  * Commands and the main loop
  */
-static const char* eol = "\n";
 
 static void help(void) {
     note("lines go to %s with %s; lines starting with ~ are for kwai:\n"
@@ -961,8 +1026,7 @@ static const char* arg_of(const char* cmd) {
 static int command(const char* line) {
     char c = line[1];
     if (c == '~') {
-        send_bytes(line + 1, (int)strlen(line + 1));
-        send_bytes(eol, (int)strlen(eol));
+        if (send_line(line + 1)) note("not connected");
     } else if (c == 'q' || c == 'Q') {
         return 1;
     } else if (c == 'l' || c == 'L') {
@@ -977,9 +1041,7 @@ static int command(const char* line) {
         const char* path = arg_of(line);
         if (!*path) { note("which file?"); return 0; }
         if (c == 'x' || c == 'X') {
-            char cmd[32];
-            snprintf(cmd, sizeof cmd, "xmodem%s", eol);
-            if (send_bytes(cmd, (int)strlen(cmd))) { note("not connected"); return 0; }
+            if (send_line("xmodem")) { note("not connected"); return 0; }
         }
         xmodem_send(path);
     } else {
@@ -991,9 +1053,10 @@ static int command(const char* line) {
 static void usage(void) {
     fprintf(stderr,
         "kwai " KWAI_VERSION ": a line-mode terminal for a serial port\n"
-        "usage: kwai [-b baud] [--crlf] PORT     (COM15, /dev/ttyACM0, ...)\n"
+        "usage: kwai [-b baud] [-p ms] [--crlf] PORT   (COM15, /dev/ttyACM0, ...)\n"
         "       kwai -l                          list the serial ports\n"
         "  -b baud   bits per second (default 115200; USB CDC ignores it)\n"
+        "  -p ms     wait up to ms for `ok>` between lines (default 100; 0: don't)\n"
         "  --crlf    end lines with CR LF instead of LF\n");
 }
 
@@ -1002,11 +1065,12 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-b") && i + 1 < argc) port_baud = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--crlf")) eol = "\r\n";
+        else if (!strcmp(argv[i], "-p") && i + 1 < argc) pace_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--list")) { list_ports(); return 0; }
         else if (argv[i][0] == '-') { usage(); return 2; }
         else snprintf(port_name, sizeof port_name, "%s", argv[i]);
     }
-    if (!port_name[0] || port_baud <= 0) {
+    if (!port_name[0] || port_baud <= 0 || pace_ms < 0) {
         usage();
         fprintf(stderr, "serial ports:\n");
         fflush(stderr);
@@ -1018,6 +1082,8 @@ int main(int argc, char** argv) {
     lock_init(&port_lock);
     lock_init(&rxq_lock);
     cond_init(&rxq_cond);
+    lock_init(&prompt_lock);
+    cond_init(&prompt_cond);
     if (start_thread(reader)) { fprintf(stderr, "kwai: can't start the reader\n"); return 1; }
 
     char line[2048];
@@ -1026,7 +1092,7 @@ int main(int argc, char** argv) {
             if (command(line)) break;
             continue;
         }
-        if (send_bytes(line, (int)strlen(line)) || send_bytes(eol, (int)strlen(eol))) {
+        if (send_line(line)) {
             note("not connected: line not sent");
         }
     }

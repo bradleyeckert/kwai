@@ -10,6 +10,10 @@ Like a console app on your desktop, they take input a line at a time and don't e
   mode, so it echoes, edits the line and keeps a history (the up arrow, on
   Windows; on Linux and macOS, run `rlwrap kwai ...` for one). Each line is
   sent when you press Enter, ending in LF.
+- **It paces pasted text.** A block pasted into the terminal goes a line
+  at a time: each line waits for LiteForth's `ok>` after the one before,
+  or 100 ms if no `ok>` comes (after an error, say). Lines typed by hand
+  aren't held up.
 - **It shows what the board sends** as it arrives, UTF-8 included (CJK
   works), and passes escape sequences on to the terminal, which handles
   colors and cursor moves.
@@ -51,6 +55,7 @@ devices.
 | Option | Meaning |
 |---|---|
 | `-b baud` | Bits per second (default 115200). A USB CDC port ignores it |
+| `-p ms` | Wait up to ms for `ok>` between lines (default 100; 0 sends without waiting) |
 | `--crlf` | End lines with CR LF instead of LF |
 
 It raises DTR and RTS when it opens the port. That matters for LiteForth on
@@ -99,7 +104,8 @@ Win32 (with SetupAPI and CfgMgr32, for the USB strings) or POSIX threads.
 
 `make test` (Linux, macOS) runs `test/test_kwai.py`: LiteForth's desktop
 `lf` runs on one pseudo-terminal, kwai on another, and the script bridges
-them. It checks that typed lines reach `lf`, that `~x` writes a file into
+them. It checks that typed lines reach `lf`, that a pasted block goes a
+line per `ok>` (and 100 ms apart with the prompt off), that `~x` writes a file into
 `lf`'s blocks byte for byte (one 2-block file with UTF-8, and a 16 KB file
 in 16 packets), and that kwai reconnects when its port disappears and comes
 back. It expects a LiteForth checkout next to this one; set `LF` and
