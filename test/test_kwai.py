@@ -115,6 +115,10 @@ def type_line(s):
 
 
 ok = []
+r = subprocess.run([kwai, "-l"], capture_output=True, text=True, timeout=10)
+if r.returncode != 0 or not r.stdout.strip():
+    print(f"FAILED: kwai -l gave {r.returncode}: {r.stdout!r} {r.stderr!r}"); sys.exit(1)
+ok.append("kwai -l lists the serial ports (or says there are none)")
 wait_for(err, "connected")
 type_line("1 2 + . 30 4 + .")
 wait_for(out, "3 34")
