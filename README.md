@@ -1,10 +1,10 @@
 # kwai
 
-Terminal emulator based on serial-to-xterm bridge.
+Terminal emulator based on a serial-to-xterm bridge.
 
 kwai connects your terminal (Windows Terminal, xterm, ...) to a serial
-port. It was made for LiteForth boards like the nanoCH32H417, which take
-input a line at a time and don't echo it:
+port. It was made for embedded systems with a cooked-input serial REPL.
+Like a console app on your desktop, they take input a line at a time and don't echo it:
 
 - **Your terminal does the typing.** The console stays in its normal line
   mode, so it echoes, edits the line and keeps a history (the up arrow, on
@@ -13,8 +13,6 @@ input a line at a time and don't echo it:
 - **It shows what the board sends** as it arrives, UTF-8 included (CJK
   works), and passes escape sequences on to the terminal, which handles
   colors and cursor moves.
-- **It sends files by XMODEM**: `~x core.f` types `xmodem` on the board and
-  sends the file into blocks.
 - **It reconnects by itself.** When the port goes away, as a USB CDC port
   does while the board is reflashed, kwai says so and reopens it as soon as
   it comes back. It also waits for a port that isn't there yet.
@@ -50,6 +48,11 @@ kwai's own messages go to stderr in brackets, such as
 `[kwai: COM15 lost; waiting for it to come back]`.
 
 ### XMODEM
+
+The XMODEM send feature is LiteForth-specific. It triggers LiteForth into XMODEM mode
+and sends the file using the `~x` command.
+
+- `~x core.f` types `xmodem` on the board and sends the file into blocks.
 
 kwai waits up to a minute for the receiver to start, showing anything the
 board prints meanwhile. It sends 1K packets (and a 128-byte one for a short
