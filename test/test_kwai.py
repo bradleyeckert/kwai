@@ -34,6 +34,7 @@ class Bridge:
         self.lf_s = lf_s
         self.k_m = None
         self.lock = threading.Lock()
+        self.eols = []                    # when each line end reached lf
         self.plug()
         threading.Thread(target=self.run, daemon=True).start()
 
@@ -67,6 +68,8 @@ class Bridge:
                     data = os.read(fd, 4096)
                 except OSError:
                     continue
+                if fd != self.lf_m:
+                    self.eols += [time.time()] * data.count(b"\n")
                 with self.lock:
                     other = self.k_m if fd == self.lf_m else self.lf_m
                     if other is None:
@@ -81,7 +84,8 @@ class Bridge:
 bridge = Bridge()
 lfp = subprocess.Popen([lf, "-t", bridge.lf_name, "-b", "115200", "-o", "3"], cwd=work,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-kp = subprocess.Popen([kwai, link], cwd=work, stdin=subprocess.PIPE,
+log = os.path.join(work, "session.log")
+kp = subprocess.Popen([kwai, "-o", log, link], cwd=work, stdin=subprocess.PIPE,
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 out, err = bytearray(), bytearray()
 
@@ -123,6 +127,78 @@ wait_for(err, "connected")
 type_line("1 2 + . 30 4 + .")
 wait_for(out, "3 34")
 ok.append("a typed line reaches lf and its output comes back")
+
+
+def paste(lines):
+    """Writes lines to kwai all at once; returns the gaps between them at lf."""
+    time.sleep(0.3)
+    start = len(bridge.eols)
+    kp.stdin.write("".join(s + "\n" for s in lines).encode())
+    kp.stdin.flush()
+    end = time.time() + 10
+    while len(bridge.eols) < start + len(lines) and time.time() < end:
+        time.sleep(0.02)
+    t = bridge.eols[start:]
+    if len(t) != len(lines):
+        print(f"FAILED: {len(t)} of {len(lines)} pasted lines reached lf"); sys.exit(1)
+    return [b - a for a, b in zip(t, t[1:])]
+
+
+gaps = paste([f"{n} drop" for n in range(5)])     # lf -o 3: no ok>
+if min(gaps) < 0.09:
+    print(f"FAILED: with no ok>, pasted lines {gaps} s apart, not 0.1"); sys.exit(1)
+ok.append("with no ok>, pasted lines go 100 ms apart")
+
+type_line("1 >options")                            # ok> on
+wait_for(out, "ok>")
+gaps = paste([f"{n} 1000 + ." for n in range(20)])
+for n in range(20):
+    wait_for(out, f"{1000 + n} ")                  # every line ran
+if max(gaps) > 0.09 or sum(gaps) > 1.0:
+    print(f"FAILED: pasted lines didn't follow ok>: gaps {gaps}"); sys.exit(1)
+ok.append("with ok>, each pasted line goes as soon as the last one's ok> comes back")
+
+
+def write(name, lines):
+    with open(os.path.join(work, name), "w") as f:
+        f.write("".join(s + "\n" for s in lines))
+
+
+def never(text, wait=0.6):
+    time.sleep(wait)
+    if text.encode() in out:
+        print(f"FAILED: {text!r} came out\n--- stdout ---\n{out.decode(errors='replace')}"
+              f"\n--- stderr ---\n{err.decode(errors='replace')}")
+        sys.exit(1)
+
+
+write("good.f", [f"7000 {n} + ." for n in (1, 2, 3)])
+type_line("~f good.f")
+wait_for(err, "sent good.f: 3 lines")
+wait_for(out, "7000 3 + .\n")                    # shown as it's sent
+wait_for(out, "7003")
+ok.append("~f sends a file's lines and shows them")
+
+write("bad.f", ["7100 1 + .", "nosuchword", "7300 3 + ."])
+type_line("~f bad.f")
+wait_for(err, "bad.f line 2 gave an error; stopped there")
+wait_for(out, "7101")
+never("7303")
+ok.append("~f stops at the line that gives an error")
+
+time.sleep(0.3)
+kp.stdin.write(b"7400 1 + .\nnosuchword\n7500 1 + .\n7600 1 + .\n")
+kp.stdin.flush()
+wait_for(err, "the rest of the paste isn't sent")
+wait_for(out, "7401")
+never("7501")
+never("7601", 0)
+time.sleep(0.3)
+type_line("7700 1 + .")                            # typed: goes
+wait_for(out, "7701")
+ok.append("a pasted line that gives an error drops the rest of the paste, not later lines")
+
+type_line("1 >options")                            # ok> off again
 
 src = os.path.join(work, "src.f")
 with open(src, "w", encoding="utf-8") as f:
@@ -174,6 +250,16 @@ wait_for(err, "~x FILE")
 type_line("~q")
 kp.wait(timeout=5)
 ok.append("~? lists the commands and ~q quits")
+with open(log, "rb") as f:
+    text = f.read()
+for want in [b"[kwai 0.", b"1 2 + . 30 4 + .\n", b"3 34", b"7000 2 + .\n", b"7002",
+             b"nosuchword ?", b"[kwai: sent good.f: 3 lines]", b"[kwai: sent src.f]"]:
+    if want not in text:
+        print(f"FAILED: the log has no {want!r}\n--- log ---\n{text.decode(errors='replace')}")
+        sys.exit(1)
+if b"7500 1 + ." in text:
+    print("FAILED: a dropped line is in the log"); sys.exit(1)
+ok.append("-o keeps a transcript: lines sent, the board's output, kwai's messages")
 lfp.kill()
 shutil.rmtree(work)
 for o in ok:
