@@ -12,8 +12,8 @@ Like a console app on your desktop, they take input a line at a time and don't e
   sent when you press Enter, ending in LF.
 - **It paces pasted text.** A block pasted into the terminal goes a line
   at a time: each line waits for LiteForth's `ok>` after the one before,
-  or 100 ms if no `ok>` comes (after an error, say). Lines typed by hand
-  aren't held up.
+  or 100 ms if no `ok>` comes. Lines typed by hand aren't held up. If a
+  pasted line gives an error, the rest of the paste isn't sent.
 - **It shows what the board sends** as it arrives, UTF-8 included (CJK
   works), and passes escape sequences on to the terminal, which handles
   colors and cursor moves.
@@ -56,6 +56,7 @@ devices.
 |---|---|
 | `-b baud` | Bits per second (default 115200). A USB CDC port ignores it |
 | `-p ms` | Wait up to ms for `ok>` between lines (default 100; 0 sends without waiting) |
+| `-o FILE` | Add a transcript of the session to FILE (see below) |
 | `--crlf` | End lines with CR LF instead of LF |
 
 It raises DTR and RTS when it opens the port. That matters for LiteForth on
@@ -67,6 +68,7 @@ Lines that start with `~` are for kwai:
 |---|---|
 | `~x FILE` | Types `xmodem` on the board, then sends FILE by XMODEM |
 | `~s FILE` | Sends FILE by XMODEM to a receiver that is already waiting |
+| `~f FILE` | Sends FILE's lines as if typed, each after the last one's `ok>`; stops at an error |
 | `~l` | Lists the serial ports |
 | `~r` | Sends Ctrl+X three times: restarts a LiteForth CH32H417 without starting its app |
 | `~~TEXT` | Sends `~TEXT` |
@@ -75,6 +77,26 @@ Lines that start with `~` are for kwai:
 
 kwai's own messages go to stderr in brackets, such as
 `[kwai: COM15 lost; waiting for it to come back]`.
+
+### Errors, `~f` and the transcript
+
+LiteForth prompts with `ok>` even after an error, so kwai looks for the
+error itself: a line ending in ` ?` (an unknown word: `foo ?`) or one
+with `Error: ior=` in it, ignoring color codes. When a pasted line gives
+one, kwai drops the lines of the paste still waiting to go (the ones that
+came in with it); the next line you type goes as usual.
+
+`~f FILE` sends a source file a line at a time, showing each line after
+the `ok>` as if you had typed it. Once the board has shown an `ok>`, each
+line waits up to 2 s for the last one's (so a line that writes flash has
+time to finish); otherwise 100 ms (`-p`). It stops at the first line that
+gives an error and says which, `[kwai: app.f line 12 gave an error;
+stopped there]`, or ends with `[kwai: sent app.f: 40 lines]`.
+
+`-o FILE` adds to FILE (it doesn't overwrite it) a dated header, then
+everything the board sends, byte for byte, color codes included
+(`less -R` shows them), each line sent, and kwai's messages. The packets of
+an XMODEM transfer aren't in it, only the messages about it.
 
 ### XMODEM
 
@@ -105,7 +127,9 @@ Win32 (with SetupAPI and CfgMgr32, for the USB strings) or POSIX threads.
 `make test` (Linux, macOS) runs `test/test_kwai.py`: LiteForth's desktop
 `lf` runs on one pseudo-terminal, kwai on another, and the script bridges
 them. It checks that typed lines reach `lf`, that a pasted block goes a
-line per `ok>` (and 100 ms apart with the prompt off), that `~x` writes a file into
+line per `ok>` (and 100 ms apart with the prompt off), that `~f` sends a
+file and stops at an error, that a pasted line with an error drops the
+rest of the paste, that `-o` keeps a transcript, that `~x` writes a file into
 `lf`'s blocks byte for byte (one 2-block file with UTF-8, and a 16 KB file
 in 16 packets), and that kwai reconnects when its port disappears and comes
 back. It expects a LiteForth checkout next to this one; set `LF` and

@@ -46,6 +46,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <time.h>
 
 #define KWAI_VERSION "0.1"
 
@@ -162,6 +163,16 @@ static int utf8_tail(const unsigned char* p, int n) {
 
 static void prompt_scan(const unsigned char* p, int n);
 
+/* -o FILE: the transcript. Port output goes in as it comes, with the lines
+ * sent and kwai's messages. Write to it with out_lock held. */
+static FILE* log_file;
+
+static void log_bytes(const void* p, size_t n) {
+    if (!log_file) return;
+    fwrite(p, 1, n, log_file);
+    fflush(log_file);
+}
+
 /* Writes port output to stdout. Call with out_lock held. */
 static void out_bytes(const unsigned char* p, int n) {
     static unsigned char carry[4];
@@ -169,6 +180,7 @@ static void out_bytes(const unsigned char* p, int n) {
     unsigned char buf[4096 + 4];
     if (n > 4096) n = 4096;
     prompt_scan(p, n);
+    log_bytes(p, (size_t)n);
     memcpy(buf, carry, (size_t)ncarry);
     memcpy(buf + ncarry, p, (size_t)n);
     int total = ncarry + n;
@@ -200,6 +212,14 @@ static void note(const char* fmt, ...) {
     va_end(ap);
     fputs("]\n", stderr);
     fflush(stderr);
+    if (log_file) {
+        fputs("\n[kwai: ", log_file);
+        va_start(ap, fmt);
+        vfprintf(log_file, fmt, ap);
+        va_end(ap);
+        fputs("]\n", log_file);
+        fflush(log_file);
+    }
     unlock(&out_lock);
 }
 
@@ -421,18 +441,21 @@ static void reader(void) {
             continue;
         }
         if (n == 0) continue;
+        /* xm_active is checked with rxq_lock held: xm_end may clear it
+         * between a check and the lock, and the bytes would be queued
+         * with nothing left to print them */
+        lock(&rxq_lock);
         if (xm_active) {
-            lock(&rxq_lock);
             for (int i = 0; i < n && rxq_head - rxq_tail < RXQ_SIZE; i++) {
                 rxq[rxq_head++ & (RXQ_SIZE - 1)] = buf[i];
             }
             cond_signal(&rxq_cond);
-            unlock(&rxq_lock);
         } else {
-            lock(&out_lock);
+            lock(&out_lock);                        /* same order as xm_end */
             out_bytes(buf, n);
             unlock(&out_lock);
         }
+        unlock(&rxq_lock);
     }
 }
 
@@ -449,54 +472,105 @@ static int send_bytes(const void* p, int n) {
 }
 
 /* ======================================================================
- * Pacing lines
+ * Pacing lines, and spotting errors
  *
  * A pasted block arrives as lines faster than the board can take them, so
  * before sending a line kwai waits for the previous one's `ok>` prompt,
- * but no longer than pace_ms after it was sent (a line that ends in an
- * error, or a board that doesn't prompt, gets no `ok>`). A line typed by
- * hand comes long after that, so it isn't held up. -p 0 turns this off.
+ * but no longer than pace_ms after it was sent (a board that doesn't
+ * prompt gets no `ok>`). A line typed by hand comes long after that, so it
+ * isn't held up. -p 0 turns this off.
+ *
+ * LiteForth still prompts after an error, so the prompt doesn't say whether
+ * a line worked. Its errors do stand out: a line ending in ` ?` (an
+ * unknown word, `foo ?`) or one with `Error: ior=` in it. prompt_scan
+ * watches the port output for those and for `ok>`, skipping escape
+ * sequences (the error is in red), so line_result can say how the last
+ * line sent went.
  */
 static const char* eol = "\n";        /* --crlf: "\r\n" */
 static int pace_ms = 100;
 static lock_t prompt_lock;
 static cond_t prompt_cond;
 static int prompt_seen;                 /* `ok>` came since the last line */
+static int prompt_ever;                 /* the board has prompted */
+static int line_error;                  /* error text since the last line */
 static int prompt_awaited;              /* a line was sent: wait for it */
 static uint64_t line_sent_ms;
 
-/* Watches port output for `ok>`. Called from out_bytes, so the text is
- * caught even across reads. */
+/* Watches port output for `ok>` and error text. Called from out_bytes, so
+ * the text is caught even across reads. */
 static void prompt_scan(const unsigned char* p, int n) {
-    static const char ok[] = "ok>";
-    static int match;
-    int seen = 0;
+    static const char ok[] = "ok>", err[] = "Error: ior=";
+    static int ok_match, err_match, esc;
+    static unsigned char last, before_last;  /* the line's last two chars */
+    int seen = 0, error = 0;
     for (int i = 0; i < n; i++) {
-        if (p[i] == (unsigned char)ok[match]) match++;
-        else match = (p[i] == (unsigned char)ok[0]);
-        if (match == 3) { seen = 1; match = 0; }
+        unsigned char c = p[i];
+        if (esc == 1) { esc = (c == '[') ? 2 : 0; continue; }   /* ESC x */
+        if (esc == 2) { if (c >= 0x40 && c <= 0x7E) esc = 0; continue; }
+        if (c == 0x1B) { esc = 1; continue; }
+        if (c == '\r' || c == '\n') {
+            if (last == '?' && before_last == ' ') error = 1;
+            last = before_last = 0;
+        } else {
+            before_last = last;
+            last = c;
+        }
+        if (c == (unsigned char)ok[ok_match]) ok_match++;
+        else ok_match = (c == (unsigned char)ok[0]);
+        if (ok_match == 3) { seen = 1; ok_match = 0; }
+        if (c == (unsigned char)err[err_match]) err_match++;
+        else err_match = (c == (unsigned char)err[0]);
+        if (err[err_match] == 0) { error = 1; err_match = 0; }
     }
-    if (seen) {
+    if (seen || error) {
         lock(&prompt_lock);
-        prompt_seen = 1;
+        if (error) line_error = 1;
+        if (seen) prompt_seen = prompt_ever = 1;
         cond_signal(&prompt_cond);
         unlock(&prompt_lock);
     }
 }
 
-/* Sends a line and its line end, after the previous line's `ok>` (or
- * pace_ms). Returns 0, or -1 if it isn't connected. */
-static int send_line(const char* text) {
+/* Waits for the last line sent to finish: its `ok>`, or ms after it was
+ * sent. Returns 1 if it gave an error, 0 if not (or no line is waiting),
+ * and leaves it waiting. */
+static int line_result(int ms) {
     lock(&prompt_lock);
-    if (prompt_awaited && pace_ms > 0) {
-        uint64_t end = line_sent_ms + (uint64_t)pace_ms;
+    if (prompt_awaited && ms > 0) {
+        uint64_t end = line_sent_ms + (uint64_t)ms;
         for (;;) {
             uint64_t t = now_ms();
             if (prompt_seen || t >= end || !connected) break;
             cond_wait_ms(&prompt_cond, &prompt_lock, (int)(end - t));
         }
     }
+    int r = prompt_awaited && line_error;
+    unlock(&prompt_lock);
+    return r;
+}
+
+/* The longest ~f waits for each line's `ok>`: long enough for a line that
+ * writes flash. Only once the board has prompted, so a board that doesn't
+ * still gets pace_ms. */
+#define FILE_LINE_MS 2000
+
+static int line_wait_ms(int file) {
+    int ms = pace_ms;
+    if (file && pace_ms > 0) {
+        lock(&prompt_lock);
+        if (prompt_ever) ms = FILE_LINE_MS;
+        unlock(&prompt_lock);
+    }
+    return ms;
+}
+
+/* Sends a line and its line end, as is: no waiting. Returns 0, or -1 if
+ * it isn't connected. With echo, the line is also shown, as if typed. */
+static int send_line_now(const char* text, int echo) {
+    lock(&prompt_lock);
     prompt_seen = 0;
+    line_error = 0;
     prompt_awaited = 0;
     unlock(&prompt_lock);
     int r = send_bytes(text, (int)strlen(text));
@@ -506,7 +580,49 @@ static int send_line(const char* text) {
         prompt_awaited = 1;
         line_sent_ms = now_ms();
         unlock(&prompt_lock);
+        lock(&out_lock);
+        if (echo) { fputs(text, stdout); fputc('\n', stdout); fflush(stdout); }
+        log_bytes(text, strlen(text));
+        log_bytes("\n", 1);
+        unlock(&out_lock);
     }
+    return r;
+}
+
+/* Sends a line after the last one has finished (line_result). Returns 0,
+ * or -1 if it isn't connected. */
+static int send_line(const char* text) {
+    line_result(pace_ms);
+    return send_line_now(text, 0);
+}
+
+/* ~f FILE: sends a text file a line at a time, each after the last one's
+ * `ok>`, showing each one. Stops at the first line that gives an error. */
+static int send_file(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { note("can't read %s", path); return -1; }
+    char line[2048];
+    long n = 0;
+    int r = 0;
+    while (fgets(line, (int)sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (n > 0 && line_result(line_wait_ms(1))) {
+            note("%s line %ld gave an error; stopped there", path, n);
+            r = -1;
+            break;
+        }
+        if (send_line_now(line, 1)) { note("not connected: %s stopped at line %ld", path, n + 1); r = -1; break; }
+        n++;
+    }
+    if (r == 0) {
+        if (n > 0 && line_result(line_wait_ms(1))) {
+            note("%s line %ld gave an error", path, n);
+            r = -1;
+        } else {
+            note("sent %s: %ld lines", path, n);
+        }
+    }
+    fclose(f);
     return r;
 }
 
@@ -1008,6 +1124,7 @@ static void help(void) {
     note("lines go to %s with %s; lines starting with ~ are for kwai:\n"
          "  ~x FILE   type `xmodem` on the board, then send FILE by XMODEM\n"
          "  ~s FILE   send FILE by XMODEM to a receiver that is already waiting\n"
+         "  ~f FILE   send FILE's lines, each after the last one's ok>; stop at an error\n"
          "  ~r        send Ctrl+X three times (restarts a LiteForth CH32H417 without its app)\n"
          "  ~l        list the serial ports\n"
          "  ~~TEXT    send ~TEXT\n"
@@ -1044,6 +1161,10 @@ static int command(const char* line) {
             if (send_line("xmodem")) { note("not connected"); return 0; }
         }
         xmodem_send(path);
+    } else if ((c == 'f' || c == 'F') && line[2] == ' ') {
+        const char* path = arg_of(line);
+        if (!*path) { note("which file?"); return 0; }
+        send_file(path);
     } else {
         help();
     }
@@ -1053,19 +1174,26 @@ static int command(const char* line) {
 static void usage(void) {
     fprintf(stderr,
         "kwai " KWAI_VERSION ": a line-mode terminal for a serial port\n"
-        "usage: kwai [-b baud] [-p ms] [--crlf] PORT   (COM15, /dev/ttyACM0, ...)\n"
-        "       kwai -l                          list the serial ports\n"
+        "usage: kwai [-b baud] [-p ms] [-o FILE] [--crlf] PORT   (COM15, /dev/ttyACM0, ...)\n"
+        "       kwai -l                                    list the serial ports\n"
         "  -b baud   bits per second (default 115200; USB CDC ignores it)\n"
         "  -p ms     wait up to ms for `ok>` between lines (default 100; 0: don't)\n"
+        "  -o FILE   add a transcript of the session to FILE\n"
         "  --crlf    end lines with CR LF instead of LF\n");
 }
 
+/* A line that read_line returned within QUEUED_MS was already waiting: a
+ * line of a paste (or of redirected input), not one typed. */
+#define QUEUED_MS 20
+
 int main(int argc, char** argv) {
+    const char* log_path = NULL;
     console_init();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-b") && i + 1 < argc) port_baud = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--crlf")) eol = "\r\n";
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) pace_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-o") && i + 1 < argc) log_path = argv[++i];
         else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--list")) { list_ports(); return 0; }
         else if (argv[i][0] == '-') { usage(); return 2; }
         else snprintf(port_name, sizeof port_name, "%s", argv[i]);
@@ -1078,6 +1206,15 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    if (log_path) {
+        log_file = fopen(log_path, "ab");
+        if (!log_file) { fprintf(stderr, "kwai: can't write %s\n", log_path); return 1; }
+        char when[64];
+        time_t t = time(NULL);
+        strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", localtime(&t));
+        fprintf(log_file, "\n[kwai %s: %s, %s]\n", KWAI_VERSION, port_name, when);
+        fflush(log_file);
+    }
     lock_init(&out_lock);
     lock_init(&port_lock);
     lock_init(&rxq_lock);
@@ -1086,8 +1223,20 @@ int main(int argc, char** argv) {
     cond_init(&prompt_cond);
     if (start_thread(reader)) { fprintf(stderr, "kwai: can't start the reader\n"); return 1; }
 
+    /* When a pasted line gives an error, the rest of the paste is dropped:
+     * the lines read without waiting. A line typed after that goes. */
     char line[2048];
-    while (read_line(line, (int)sizeof line) == 0) {
+    int dropping = 0;
+    for (;;) {
+        uint64_t asked = now_ms();
+        if (read_line(line, (int)sizeof line)) break;
+        int queued = now_ms() - asked < QUEUED_MS;
+        if (!queued) dropping = 0;
+        else if (!dropping && line_result(pace_ms)) {
+            dropping = 1;
+            note("a pasted line gave an error; the rest of the paste isn't sent");
+        }
+        if (dropping) continue;
         if (line[0] == '~') {
             if (command(line)) break;
             continue;
