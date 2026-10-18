@@ -7,7 +7,8 @@ lf runs on one pty (`lf -t`), kwai on another, and this script copies bytes
 between the two masters. kwai's port is a symlink, so the script can unplug
 it (close the pty and remove the link) and plug a new one in, as a USB CDC
 device does when the board is reflashed. It checks that typed lines reach
-lf, that `~x` sends source and binary files into blocks by YMODEM, and
+lf, that `~x` sends source and binary files into blocks by YMODEM and
+replaces a whole block file, and
 that kwai reconnects.
 """
 import os
@@ -250,6 +251,24 @@ want += bytes(2 * 4096 - len(want))
 if got != want:
     print("FAILED: the binary file differs in blocks 60-61"); sys.exit(1)
 ok.append("~x FILE N sends a binary file from byte 32 of block N, exactly (Ctrl+X and SUB bytes kept)")
+
+with open(os.path.join(work, "lfblocks.fb4"), "rb") as f:
+    image = bytearray(f.read())
+row = ".( block 70, installed ) cr".encode()
+image[70 * 4096:71 * 4096] = row + b" " * (4096 - len(row))
+whole = os.path.join(work, "whole.fb4")
+with open(whole, "wb") as f:
+    f.write(image)
+type_line("~x whole.fb4 -1")
+wait_for(err, "sent whole.fb4", 120)
+wait_for(out, "ymodem: whole.fb4: installed, %d blocks, read back and checked" % (len(image) // 4096))
+time.sleep(0.5)
+with open(os.path.join(work, "lfblocks.fb4"), "rb") as f:
+    if f.read() != bytes(image):
+        print("FAILED: the installed block file differs"); sys.exit(1)
+type_line("70 load")
+wait_for(out, "block 70, installed")
+ok.append("~x FILE -1 replaces the whole block file")
 
 bridge.unplug()
 wait_for(err, "lost")

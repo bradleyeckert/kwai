@@ -68,6 +68,7 @@ Lines that start with `~` are for kwai:
 |---|---|
 | `~x FILE` | Types `0 ymodem` on the board, then sends FILE (Forth source) by YMODEM into the blocks its `( BLOCK n )` lines name |
 | `~x FILE N` | Types `N ymodem`, then sends FILE (binary, such as a font) by YMODEM into blocks from byte 32 of block N |
+| `~x FILE -1` | Types `-1 ymodem`, then sends FILE, a whole block file (`lfblocks.fb4`, plain or sealed), to replace the board's |
 | `~s FILE` | Sends FILE by YMODEM to a receiver that is already waiting |
 | `~f FILE` | Sends FILE's lines as if typed, each after the last one's `ok>`; stops at an error |
 | `~l` | Lists the serial ports |
@@ -108,6 +109,12 @@ board and sends the file with YMODEM.
   `( BLOCK n )` lines name, as `putblocks.py` does.
 - `~x cjk24.fnt 100` types `100 ymodem` and sends a binary file from byte
   32 of block 100, as `putbin.py` does.
+- `~x lfblocks.fb4 -1` types `-1 ymodem` and sends a whole block file,
+  block 0 included, which replaces the one on the board's card, so the
+  card can stay in the board. It must fit in the space the card's
+  `lfblocks.fb4` already has. The board checks block 0 before it writes
+  anything (a sealed file must be one it can open), reads the file back
+  when the transfer ends, and reports its new `capacity`.
 
 YMODEM's first packet gives the file's name and length, so the board keeps
 exactly the file's bytes, binary ones included, and none of the padding.
