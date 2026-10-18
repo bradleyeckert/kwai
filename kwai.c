@@ -48,7 +48,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#define KWAI_VERSION "0.2"
+#define KWAI_VERSION "0.3"
 
 /* ======================================================================
  * Threads, locks and time
@@ -1173,6 +1173,7 @@ static void help(void) {
     note("lines go to %s with %s; lines starting with ~ are for kwai:\n"
          "  ~x FILE   type `0 ymodem` on the board, then send source FILE into blocks by YMODEM\n"
          "  ~x FILE N type `N ymodem`, then send binary FILE from byte 32 of block N\n"
+         "  ~x FILE -1  type `-1 ymodem`, then send FILE: a whole block file to replace the board's\n"
          "  ~s FILE   send FILE by YMODEM to a receiver that is already waiting\n"
          "  ~f FILE   send FILE's lines, each after the last one's ok>; stop at an error\n"
          "  ~r        send Ctrl+X three times (restarts a LiteForth CH32H417 without its app)\n"
@@ -1210,16 +1211,21 @@ static int command(const char* line) {
         size_t n = strlen(path);
         while (n && path[n - 1] == ' ') path[--n] = '\0';
         if (!n) { note("which file?"); return 0; }
-        unsigned long block = 0;
-        char* last = strrchr(path, ' ');            /* ~x FILE N: a block number */
-        if (last && last[1] && strspn(last + 1, "0123456789") == strlen(last + 1)) {
-            block = strtoul(last + 1, NULL, 10);
-            while (last > path && last[-1] == ' ') last--;
-            *last = '\0';
+        char block[16] = "0";
+        char* last = strrchr(path, ' ');            /* ~x FILE N: a block number, */
+        if (last && last[1]) {                      /* or -1: a whole block file */
+            const char* num = last + 1;
+            int whole = !strcmp(num, "-1");
+            size_t digits = strspn(num, "0123456789");
+            if (whole || (digits && digits == strlen(num) && digits < sizeof block)) {
+                snprintf(block, sizeof block, "%s", num);
+                while (last > path && last[-1] == ' ') last--;
+                *last = '\0';
+            }
         }
         if (c == 'x' || c == 'X') {
             char cmd[32];
-            snprintf(cmd, sizeof cmd, "%lu ymodem", block);
+            snprintf(cmd, sizeof cmd, "%s ymodem", block);
             if (send_line(cmd)) { note("not connected"); return 0; }
         }
         ymodem_send(path);
