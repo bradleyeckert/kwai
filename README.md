@@ -68,14 +68,17 @@ Lines that start with `~` are for kwai:
 |---|---|
 | `~x FILE` | Types `0 ymodem` on the board, then sends FILE (Forth source) by YMODEM into the blocks its `( BLOCK n )` lines name |
 | `~x FILE N` | Types `N ymodem`, then sends FILE (binary, such as a font) by YMODEM into blocks from byte 32 of block N |
-| `~x FILE -1` | Types `-1 ymodem`, then sends FILE, a whole block file (`lfblocks.fb4`, plain or sealed), to replace the board's |
+| `~x FILE -1` | Types `-1 ymodem`, then sends FILE, a whole block file (`lfblocks.fb4`, plain or sealed), to replace the board's. FILE must be whole 4 KB blocks starting with `LITEFORTH`, or nothing is typed |
 | `~s FILE` | Sends FILE by YMODEM to a receiver that is already waiting |
 | `~f FILE` | Sends FILE's lines as if typed, each after the last one's `ok>`; stops at an error |
 | `~l` | Lists the serial ports |
 | `~r` | Sends Ctrl+X three times: restarts a LiteForth CH32H417 without starting its app |
 | `~~TEXT` | Sends `~TEXT` |
-| `~?` | Lists these |
+| `~?` | Lists these, with kwai's version and build time |
 | `~q` | Quits (so does Ctrl+C) |
+
+`~x` reads FILE before it types anything on the board, so a missing file
+starts nothing there.
 
 kwai's own messages go to stderr in brackets, such as
 `[kwai: COM15 lost; waiting for it to come back]`.

@@ -259,6 +259,20 @@ image[70 * 4096:71 * 4096] = row + b" " * (4096 - len(row))
 whole = os.path.join(work, "whole.fb4")
 with open(whole, "wb") as f:
     f.write(image)
+start = len(out)
+type_line("~x nosuchfile.f")
+wait_for(err, "can't read nosuchfile.f")
+with open(os.path.join(work, "short.fb4"), "wb") as f:
+    f.write(bytes(image[:5000]))
+type_line("~x short.fb4 -1")
+wait_for(err, "short.fb4 isn't a block file")
+type_line("40 2 + .")
+wait_for(out, "42")
+if b"ymodem" in out[start:]:
+    print("FAILED: a bad ~x started ymodem on the board\n" + out[start:].decode(errors="replace"))
+    sys.exit(1)
+ok.append("~x checks the file before typing `ymodem`: a missing file or a bad -1 file starts nothing")
+
 type_line("~x whole.fb4 -1")
 wait_for(err, "sent whole.fb4", 120)
 wait_for(out, "ymodem: whole.fb4: installed, %d blocks, read back and checked" % (len(image) // 4096))
@@ -284,6 +298,7 @@ ok.append("the port vanishing and coming back: kwai says so and carries on")
 
 type_line("~?")
 wait_for(err, "~x FILE")
+wait_for(err, "kwai 0.4, built ")
 type_line("~q")
 kp.wait(timeout=5)
 ok.append("~? lists the commands and ~q quits")
