@@ -66,8 +66,9 @@ Lines that start with `~` are for kwai:
 
 | Command | What it does |
 |---|---|
-| `~x FILE` | Types `xmodem` on the board, then sends FILE by XMODEM |
-| `~s FILE` | Sends FILE by XMODEM to a receiver that is already waiting |
+| `~x FILE` | Types `0 ymodem` on the board, then sends FILE (Forth source) by YMODEM into the blocks its `( BLOCK n )` lines name |
+| `~x FILE N` | Types `N ymodem`, then sends FILE (binary, such as a font) by YMODEM into blocks from byte 32 of block N |
+| `~s FILE` | Sends FILE by YMODEM to a receiver that is already waiting |
 | `~f FILE` | Sends FILE's lines as if typed, each after the last one's `ok>`; stops at an error |
 | `~l` | Lists the serial ports |
 | `~r` | Sends Ctrl+X three times: restarts a LiteForth CH32H417 without starting its app |
@@ -96,21 +97,26 @@ stopped there]`, or ends with `[kwai: sent app.f: 40 lines]`.
 `-o FILE` adds to FILE (it doesn't overwrite it) a dated header, then
 everything the board sends, byte for byte, color codes included
 (`less -R` shows them), each line sent, and kwai's messages. The packets of
-an XMODEM transfer aren't in it, only the messages about it.
+a YMODEM transfer aren't in it, only the messages about it.
 
-### XMODEM
+### YMODEM
 
-The XMODEM send feature is LiteForth-specific. It triggers LiteForth into XMODEM mode
-and sends the file using the `~x` command.
+Sending files is LiteForth-specific: `~x` types the `ymodem` word on the
+board and sends the file with YMODEM.
 
-- `~x core.f` types `xmodem` on the board and sends the file into blocks.
+- `~x core.f` types `0 ymodem` and sends Forth source into the blocks its
+  `( BLOCK n )` lines name, as `putblocks.py` does.
+- `~x cjk24.fnt 100` types `100 ymodem` and sends a binary file from byte
+  32 of block 100, as `putbin.py` does.
 
-kwai waits up to a minute for the receiver to start, showing anything the
-board prints meanwhile. It sends 1K packets (and a 128-byte one for a short
-last piece), with an 8-bit checksum or CRC-16, whichever the receiver asks
-for: LiteForth's `xmodem` asks for checksums. A packet is sent up to 10
-times; after that kwai cancels the transfer. It shows the packet count as
-it goes.
+YMODEM's first packet gives the file's name and length, so the board keeps
+exactly the file's bytes, binary ones included, and none of the padding.
+kwai waits up to a minute for the receiver to ask (with `C`), showing
+anything the board prints meanwhile. It sends 1K packets (and a 128-byte
+one for a short last piece) with CRC-16. A packet is sent up to 10 times;
+after that kwai cancels the transfer with two CANs (three would be the
+CH32H417's Ctrl+X x3 escape). It shows the packet count as it goes, and
+LiteForth reports what it wrote when the transfer ends.
 
 ## Building
 
@@ -130,8 +136,8 @@ them. It checks that typed lines reach `lf`, that a pasted block goes a
 line per `ok>` (and 100 ms apart with the prompt off), that `~f` sends a
 file and stops at an error, that a pasted line with an error drops the
 rest of the paste, that `-o` keeps a transcript, that `~x` writes a file into
-`lf`'s blocks byte for byte (one 2-block file with UTF-8, and a 16 KB file
-in 16 packets), and that kwai reconnects when its port disappears and comes
+`lf`'s blocks byte for byte (one 2-block file with UTF-8, a 16 KB file
+in 16 packets, and a binary file with Ctrl+X and SUB bytes at block 60), and that kwai reconnects when its port disappears and comes
 back. It expects a LiteForth checkout next to this one; set `LF` and
 `BLOCKS` to point elsewhere:
 

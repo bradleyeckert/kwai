@@ -8,7 +8,7 @@
  * sent to the port when Enter is pressed, ending in LF; a pasted block goes
  * a line at a time, each after the board's `ok>` for the last (or 100 ms).
  * A reader thread prints what the port sends. Lines that start with ~ are
- * commands for kwai itself (~? lists them), including an XMODEM send.
+ * commands for kwai itself (~? lists them), including a YMODEM send.
  *
  * If the port goes away (a USB CDC device re-enumerating after a reflash),
  * kwai says so and reopens it as soon as it comes back. It also waits for
@@ -48,7 +48,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#define KWAI_VERSION "0.1"
+#define KWAI_VERSION "0.2"
 
 /* ======================================================================
  * Threads, locks and time
@@ -392,7 +392,7 @@ static int port_write(const unsigned char* p, int n) {
  * The reader thread
  *
  * It owns opening and closing the port. While connected, it reads the
- * port and either prints the bytes or, during an XMODEM transfer, queues
+ * port and either prints the bytes or, during a YMODEM transfer, queues
  * them for xm_getc. When a read or a write fails it closes the port and
  * tries to reopen it every RETRY_MS until it succeeds.
  */
@@ -627,14 +627,18 @@ static int send_file(const char* path) {
 }
 
 /* ======================================================================
- * XMODEM send
+ * YMODEM send
  *
- * Original XMODEM with 1K packets: the receiver starts it with NAK
- * (8-bit checksum) or 'C' (CRC-16); each packet is STX (1024 bytes) or
- * SOH (128, for the last short piece), the block number and its
- * complement, the data padded with SUB, and the checksum or CRC; EOT ends
- * the transfer. LiteForth's `xmodem` asks for checksums and takes 1K
- * packets. Text the board prints before the first NAK is shown.
+ * YMODEM batch with CRC-16 and 1K packets: the receiver asks with 'C'.
+ * Packet 0 carries the file's name, a NUL and its length in decimal; the
+ * receiver ACKs it and asks again with 'C'. Each data packet is STX
+ * (1024 bytes) or SOH (128, for a short last piece), the block number and
+ * its complement, the data padded with SUB, and the CRC (big-endian). EOT
+ * ends the file (the receiver NAKs the first one and ACKs the second), and
+ * an empty packet 0 ends the batch. The length tells the receiver which
+ * bytes are padding, so binary files arrive exactly. Text the board
+ * prints before the first 'C' is shown; LiteForth's `ymodem` prints its
+ * reports after the batch.
  */
 #define SOH 0x01
 #define STX 0x02
@@ -643,6 +647,8 @@ static int send_file(const char* path) {
 #define NAK 0x15
 #define CAN 0x18
 #define SUB 0x1A
+
+#define CRC 'C'
 
 #define XM_START_MS   60000             /* wait for the receiver to start */
 #define XM_REPLY_MS   10000             /* wait for ACK or NAK */
@@ -698,8 +704,59 @@ static unsigned char* read_file(const char* path, long* size) {
     return data;
 }
 
-/* Sends a file by XMODEM. Returns 0 if the receiver took all of it. */
-static int xmodem_send(const char* path) {
+/* Builds packet blockno of len bytes (128 or 1024) from take bytes of src,
+   padded with pad, with its CRC. Returns the packet's length. */
+static int make_packet(unsigned char* pkt, unsigned char blockno, const unsigned char* src,
+                       long take, int len, unsigned char pad) {
+    pkt[0] = (len == 1024) ? STX : SOH;
+    pkt[1] = blockno;
+    pkt[2] = (unsigned char)~blockno;
+    if (take > 0) memcpy(pkt + 3, src, (size_t)take);
+    memset(pkt + 3 + take, pad, (size_t)(len - take));
+    uint16_t c = crc16(pkt + 3, len);
+    pkt[3 + len] = (unsigned char)(c >> 8);
+    pkt[4 + len] = (unsigned char)c;
+    return 5 + len;
+}
+
+/* Sends a packet until it's ACKed. Returns 0, or -1 (cancelled, gone, or
+   too many tries: the message is shown). */
+static int send_packet(const unsigned char* pkt, int plen, const char* what) {
+    for (int tries = 0; ; ) {
+        if (send_bytes(pkt, plen)) { note("the port went away"); return -1; }
+        int reply = xm_getc(XM_REPLY_MS);
+        while (reply >= 0 && reply != ACK && reply != NAK && reply != CAN) reply = xm_getc(XM_REPLY_MS);
+        if (reply == ACK) return 0;
+        if (reply == CAN) { note("the receiver cancelled at %s", what); return -1; }
+        if (++tries >= XM_RETRIES) { note("%s failed %d times", what, tries); return -2; }
+    }
+}
+
+/* Waits for the receiver's 'C'; shows other text. Returns 0 or -1. */
+static int await_c(int ms, const char* why) {
+    uint64_t end = now_ms() + (uint64_t)ms;
+    while (now_ms() < end && connected) {
+        int c = xm_getc(500);
+        if (c == CRC) return 0;
+        if (c == CAN) { note("the receiver cancelled"); return -1; }
+        if (c == NAK) { note("the receiver asks for XMODEM checksums; kwai sends YMODEM"); return -1; }
+        if (c >= 0) { unsigned char b = (unsigned char)c; lock(&out_lock); out_bytes(&b, 1); unlock(&out_lock); }
+    }
+    note("%s", why);
+    return -1;
+}
+
+static const char* base_name(const char* path) {
+    const char* b = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') b = p + 1;
+    }
+    return b;
+}
+
+/* Sends a file by YMODEM, as a batch of one. Returns 0 if the receiver
+   took all of it. */
+static int ymodem_send(const char* path) {
     long size = 0;
     unsigned char* data = read_file(path, &size);
     if (!data) { note("can't read %s", path); return -1; }
@@ -709,60 +766,45 @@ static int xmodem_send(const char* path) {
     xm_active = 1;
     unlock(&rxq_lock);
 
-    /* the receiver's start: NAK or 'C'; show any text before it */
-    int crc = -1;
-    uint64_t end = now_ms() + XM_START_MS;
-    while (crc < 0 && now_ms() < end) {
-        int c = xm_getc(500);
-        if (c == NAK) crc = 0;
-        else if (c == 'C') crc = 1;
-        else if (c == CAN) { note("the receiver cancelled"); goto fail; }
-        else if (c >= 0) { unsigned char b = (unsigned char)c; lock(&out_lock); out_bytes(&b, 1); unlock(&out_lock); }
-        if (!connected) break;
-    }
-    if (crc < 0) { note("no XMODEM receiver answered"); goto fail; }
+    unsigned char pkt[5 + 1024];
+    int plen, r;
+    if (await_c(XM_START_MS, "no YMODEM receiver answered")) goto fail;
+
+    /* packet 0: the name and the length */
+    unsigned char info[128];
+    const char* name = base_name(path);
+    memset(info, 0, sizeof info);
+    int n = snprintf((char*)info, 100, "%s", name);
+    if (n > 99) n = 99;
+    snprintf((char*)info + n + 1, sizeof info - (size_t)n - 1, "%ld", size);
+    plen = make_packet(pkt, 0, info, 128, 128, 0);
+    note("sending %s: %ld bytes", path, size);
+    r = send_packet(pkt, plen, "the header");
+    if (r == -2) goto cancel;
+    if (r) goto fail;
+    if (await_c(XM_REPLY_MS, "the receiver didn't ask for the data")) goto fail;
 
     long packets = (size + 1023) / 1024, sent = 0;
-    unsigned char pkt[3 + 1024 + 2];
     unsigned char blockno = 1;
-    note("sending %s: %ld bytes, %s", path, size, crc ? "CRC" : "checksum");
-    for (long pos = 0; pos < size || (size == 0 && pos == 0); ) {
+    for (long pos = 0; pos < size; ) {
         long left = size - pos;
         int len = (left > 128) ? 1024 : 128;
-        pkt[0] = (len == 1024) ? STX : SOH;
-        pkt[1] = blockno;
-        pkt[2] = (unsigned char)~blockno;
         long take = (left < len) ? left : len;
-        if (take > 0) memcpy(pkt + 3, data + pos, (size_t)take);
-        memset(pkt + 3 + take, SUB, (size_t)(len - take));
-        int plen = 3 + len;
-        if (crc) {
-            uint16_t c = crc16(pkt + 3, len);
-            pkt[plen++] = (unsigned char)(c >> 8);
-            pkt[plen++] = (unsigned char)c;
-        } else {
-            unsigned char sum = 0;
-            for (int i = 0; i < len; i++) sum = (unsigned char)(sum + pkt[3 + i]);
-            pkt[plen++] = sum;
-        }
-        int tries = 0, reply = -1;
-        for (;;) {
-            if (send_bytes(pkt, plen)) { note("the port went away"); goto fail; }
-            reply = xm_getc(XM_REPLY_MS);
-            while (reply >= 0 && reply != ACK && reply != NAK && reply != CAN) reply = xm_getc(XM_REPLY_MS);
-            if (reply == ACK) break;
-            if (reply == CAN) { note("the receiver cancelled at packet %ld", sent + 1); goto fail; }
-            if (++tries >= XM_RETRIES) { note("packet %ld failed %d times", sent + 1, tries); goto cancel; }
-        }
+        plen = make_packet(pkt, blockno, data + pos, take, len, SUB);
+        char what[32];
+        snprintf(what, sizeof what, "packet %ld", sent + 1);
+        r = send_packet(pkt, plen, what);
+        if (r == -2) goto cancel;
+        if (r) goto fail;
         pos += take;
         blockno++;
         sent++;
         lock(&out_lock);
-        fprintf(stderr, "\r[kwai: %ld/%ld]", sent, packets > 0 ? packets : 1);
+        fprintf(stderr, "\r[kwai: %ld/%ld]", sent, packets);
         fflush(stderr);
         unlock(&out_lock);
-        if (size == 0) break;
     }
+    /* EOT: NAKed once, then ACKed (an ACK the first time is fine too) */
     for (int tries = 0; ; tries++) {
         unsigned char eot = EOT;
         if (send_bytes(&eot, 1)) { note("the port went away"); goto fail; }
@@ -771,14 +813,21 @@ static int xmodem_send(const char* path) {
         if (reply == ACK) break;
         if (tries >= XM_RETRIES) { note("EOT not acknowledged"); goto fail; }
     }
+    /* the end of the batch: an empty packet 0 */
+    if (await_c(XM_REPLY_MS, "the receiver didn't ask for the next file")) goto fail;
+    memset(info, 0, sizeof info);
+    plen = make_packet(pkt, 0, info, 128, 128, 0);
+    r = send_packet(pkt, plen, "the end of the batch");
+    if (r == -2) goto cancel;
+    if (r) goto fail;
     note("sent %s", path);
     free(data);
     xm_end();
     return 0;
 cancel:
     {
-        unsigned char can[3] = { CAN, CAN, CAN };
-        send_bytes(can, 3);
+        unsigned char can[2] = { CAN, CAN };    /* two: three would be Ctrl+X x3 */
+        send_bytes(can, 2);
     }
 fail:
     free(data);
@@ -1122,8 +1171,9 @@ static int list_ports(void) {
 
 static void help(void) {
     note("lines go to %s with %s; lines starting with ~ are for kwai:\n"
-         "  ~x FILE   type `xmodem` on the board, then send FILE by XMODEM\n"
-         "  ~s FILE   send FILE by XMODEM to a receiver that is already waiting\n"
+         "  ~x FILE   type `0 ymodem` on the board, then send source FILE into blocks by YMODEM\n"
+         "  ~x FILE N type `N ymodem`, then send binary FILE from byte 32 of block N\n"
+         "  ~s FILE   send FILE by YMODEM to a receiver that is already waiting\n"
          "  ~f FILE   send FILE's lines, each after the last one's ok>; stop at an error\n"
          "  ~r        send Ctrl+X three times (restarts a LiteForth CH32H417 without its app)\n"
          "  ~l        list the serial ports\n"
@@ -1155,12 +1205,24 @@ static int command(const char* line) {
         static const unsigned char x3[3] = { 0x18, 0x18, 0x18 };
         if (send_bytes(x3, 3)) note("not connected");
     } else if ((c == 'x' || c == 'X' || c == 's' || c == 'S') && line[2] == ' ') {
-        const char* path = arg_of(line);
-        if (!*path) { note("which file?"); return 0; }
-        if (c == 'x' || c == 'X') {
-            if (send_line("xmodem")) { note("not connected"); return 0; }
+        char path[2048];
+        snprintf(path, sizeof path, "%s", arg_of(line));
+        size_t n = strlen(path);
+        while (n && path[n - 1] == ' ') path[--n] = '\0';
+        if (!n) { note("which file?"); return 0; }
+        unsigned long block = 0;
+        char* last = strrchr(path, ' ');            /* ~x FILE N: a block number */
+        if (last && last[1] && strspn(last + 1, "0123456789") == strlen(last + 1)) {
+            block = strtoul(last + 1, NULL, 10);
+            while (last > path && last[-1] == ' ') last--;
+            *last = '\0';
         }
-        xmodem_send(path);
+        if (c == 'x' || c == 'X') {
+            char cmd[32];
+            snprintf(cmd, sizeof cmd, "%lu ymodem", block);
+            if (send_line(cmd)) { note("not connected"); return 0; }
+        }
+        ymodem_send(path);
     } else if ((c == 'f' || c == 'F') && line[2] == ' ') {
         const char* path = arg_of(line);
         if (!*path) { note("which file?"); return 0; }

@@ -7,7 +7,8 @@ lf runs on one pty (`lf -t`), kwai on another, and this script copies bytes
 between the two masters. kwai's port is a symlink, so the script can unplug
 it (close the pty and remove the link) and plug a new one in, as a USB CDC
 device does when the board is reflashed. It checks that typed lines reach
-lf, that `~x` sends a file into blocks by XMODEM, and that kwai reconnects.
+lf, that `~x` sends source and binary files into blocks by YMODEM, and
+that kwai reconnects.
 """
 import os
 import pty
@@ -206,11 +207,11 @@ with open(src, "w", encoding="utf-8") as f:
             "( BLOCK 41 )\n.( block 41 ) cr\n")
 type_line("~x src.f")
 wait_for(err, "sent src.f", 30)
-wait_for(out, "xmodem: 2 blocks written: 40 41")   # exact, so no byte was lost
+wait_for(out, "ymodem: src.f: 2 blocks written: 40 41")   # exact, so no byte was lost
 type_line("40 load 41 load")
 wait_for(out, "hello from block 40 学")
 wait_for(out, "block 41")
-ok.append("~x types `xmodem` and sends a file into blocks (2 blocks, UTF-8 intact)")
+ok.append("~x types `0 ymodem` and sends a file into blocks (2 blocks, UTF-8 intact)")
 
 big = os.path.join(work, "big.f")                 # 5 full blocks: 16 KB, 16 packets
 rows = []
@@ -221,7 +222,7 @@ with open(big, "w") as f:
     f.write("\n".join(rows) + "\n")
 type_line("~x big.f")
 wait_for(err, "sent big.f", 60)
-wait_for(out, "xmodem: 5 blocks written: 50 51 52 53 54")
+wait_for(out, "ymodem: big.f: 5 blocks written: 50 51 52 53 54")
 time.sleep(0.5)
 with open(os.path.join(work, "lfblocks.fb4"), "rb") as f:
     data = f.read()
@@ -232,6 +233,23 @@ for blk in range(50, 55):
         if got[r * 128:(r + 1) * 128].rstrip(b" ") != line:
             print(f"FAILED: block {blk} row {r} differs"); sys.exit(1)
 ok.append("a 16 KB file (16 1K packets) arrives byte for byte in blocks 50-54")
+
+binary = os.path.join(work, "font.bin")           # Ctrl+X runs and SUBs, exact length
+payload = bytes((i * 13) & 255 for i in range(6000)) + bytes([0x18] * 4) + bytes([0x1A] * 5)
+with open(binary, "wb") as f:
+    f.write(payload)
+type_line("~x font.bin 60")
+wait_for(err, "sent font.bin", 60)
+wait_for(out, "ymodem: font.bin: 6009 bytes from byte 32 of block 60 to block 61, next free block 62")
+time.sleep(0.5)
+with open(os.path.join(work, "lfblocks.fb4"), "rb") as f:
+    f.seek(60 * 4096)
+    got = f.read(2 * 4096)
+want = bytes(32) + payload
+want += bytes(2 * 4096 - len(want))
+if got != want:
+    print("FAILED: the binary file differs in blocks 60-61"); sys.exit(1)
+ok.append("~x FILE N sends a binary file from byte 32 of block N, exactly (Ctrl+X and SUB bytes kept)")
 
 bridge.unplug()
 wait_for(err, "lost")
