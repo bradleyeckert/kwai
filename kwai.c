@@ -48,7 +48,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#define KWAI_VERSION "0.3"
+#define KWAI_VERSION "0.4"
 
 /* ======================================================================
  * Threads, locks and time
@@ -754,12 +754,9 @@ static const char* base_name(const char* path) {
     return b;
 }
 
-/* Sends a file by YMODEM, as a batch of one. Returns 0 if the receiver
-   took all of it. */
-static int ymodem_send(const char* path) {
-    long size = 0;
-    unsigned char* data = read_file(path, &size);
-    if (!data) { note("can't read %s", path); return -1; }
+/* Sends path's contents, data (size bytes, from read_file), by YMODEM as a
+   batch of one, and frees data. Returns 0 if the receiver took all of it. */
+static int ymodem_send(const char* path, unsigned char* data, long size) {
     if (!connected) { note("not connected"); free(data); return -1; }
     lock(&rxq_lock);
     rxq_head = rxq_tail = 0;
@@ -1170,7 +1167,8 @@ static int list_ports(void) {
  */
 
 static void help(void) {
-    note("lines go to %s with %s; lines starting with ~ are for kwai:\n"
+    note("kwai " KWAI_VERSION ", built " __DATE__ " " __TIME__ "\n"
+         "lines go to %s with %s; lines starting with ~ are for kwai:\n"
          "  ~x FILE   type `0 ymodem` on the board, then send source FILE into blocks by YMODEM\n"
          "  ~x FILE N type `N ymodem`, then send binary FILE from byte 32 of block N\n"
          "  ~x FILE -1  type `-1 ymodem`, then send FILE: a whole block file to replace the board's\n"
@@ -1223,12 +1221,22 @@ static int command(const char* line) {
                 *last = '\0';
             }
         }
+        long size = 0;                              /* before the board waits for it */
+        unsigned char* data = read_file(path, &size);
+        if (!data) { note("can't read %s", path); return 0; }
+        if (!strcmp(block, "-1") && (size == 0 || size % 4096 || size < 9
+                                     || memcmp(data, "LITEFORTH", 9))) {
+            note("%s isn't a block file (whole 4 KB blocks, starting with LITEFORTH): not sent",
+                 path);
+            free(data);
+            return 0;
+        }
         if (c == 'x' || c == 'X') {
             char cmd[32];
             snprintf(cmd, sizeof cmd, "%s ymodem", block);
-            if (send_line(cmd)) { note("not connected"); return 0; }
+            if (send_line(cmd)) { note("not connected"); free(data); return 0; }
         }
-        ymodem_send(path);
+        ymodem_send(path, data, size);
     } else if ((c == 'f' || c == 'F') && line[2] == ' ') {
         const char* path = arg_of(line);
         if (!*path) { note("which file?"); return 0; }
