@@ -48,7 +48,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#define KWAI_VERSION "0.4"
+#define KWAI_VERSION "0.5"
 
 /* ======================================================================
  * Threads, locks and time
@@ -1172,6 +1172,7 @@ static void help(void) {
          "  ~x FILE   type `0 ymodem` on the board, then send source FILE into blocks by YMODEM\n"
          "  ~x FILE N type `N ymodem`, then send binary FILE from byte 32 of block N\n"
          "  ~x FILE -1  type `-1 ymodem`, then send FILE: a whole block file to replace the board's\n"
+         "  ~x FILE -2  type `-2 ymodem`, then send FILE: a firmware update package into lfstage.bin\n"
          "  ~s FILE   send FILE by YMODEM to a receiver that is already waiting\n"
          "  ~f FILE   send FILE's lines, each after the last one's ok>; stop at an error\n"
          "  ~r        send Ctrl+X three times (restarts a LiteForth CH32H417 without its app)\n"
@@ -1211,9 +1212,9 @@ static int command(const char* line) {
         if (!n) { note("which file?"); return 0; }
         char block[16] = "0";
         char* last = strrchr(path, ' ');            /* ~x FILE N: a block number, */
-        if (last && last[1]) {                      /* or -1: a whole block file */
-            const char* num = last + 1;
-            int whole = !strcmp(num, "-1");
+        if (last && last[1]) {                      /* -1: a whole block file, */
+            const char* num = last + 1;             /* -2: an update package */
+            int whole = !strcmp(num, "-1") || !strcmp(num, "-2");
             size_t digits = strspn(num, "0123456789");
             if (whole || (digits && digits == strlen(num) && digits < sizeof block)) {
                 snprintf(block, sizeof block, "%s", num);
@@ -1224,10 +1225,18 @@ static int command(const char* line) {
         long size = 0;                              /* before the board waits for it */
         unsigned char* data = read_file(path, &size);
         if (!data) { note("can't read %s", path); return 0; }
+        int package = size >= 10 && !memcmp(data, "LITEFORTHF", 10);
         if (!strcmp(block, "-1") && (size == 0 || size % 4096 || size < 9
-                                     || memcmp(data, "LITEFORTH", 9))) {
-            note("%s isn't a block file (whole 4 KB blocks, starting with LITEFORTH): not sent",
+                                     || memcmp(data, "LITEFORTH", 9) || package)) {
+            note(package ? "%s is a firmware update package: send it with ~x FILE -2"
+                         : "%s isn't a block file (whole 4 KB blocks, starting with LITEFORTH): not sent",
                  path);
+            free(data);
+            return 0;
+        }
+        if (!strcmp(block, "-2") && (size == 0 || size % 4096 || !package)) {
+            note("%s isn't a firmware update package (whole 4 KB blocks, starting with "
+                 "LITEFORTHF): not sent", path);
             free(data);
             return 0;
         }
