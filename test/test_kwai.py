@@ -273,6 +273,30 @@ if b"ymodem" in out[start:]:
     sys.exit(1)
 ok.append("~x checks the file before typing `ymodem`: a missing file or a bad -1 file starts nothing")
 
+pkg = b"LITEFORTHF" + bytes(3 * 4096 - 10)          # not a real one: lf can't check it
+with open(os.path.join(work, "fake.lfu"), "wb") as f:
+    f.write(pkg)
+start = len(out)
+type_line("~x fake.lfu -1")
+wait_for(err, "fake.lfu is a firmware update package: send it with ~x FILE -2")
+type_line("~x short.fb4 -2")
+wait_for(err, "short.fb4 isn't a firmware update package")
+type_line("41 2 + .")
+wait_for(out, "43")
+if b"ymodem" in out[start:]:
+    print("FAILED: a refused ~x started ymodem\n" + out[start:].decode(errors="replace"))
+    sys.exit(1)
+with open(os.path.join(work, "lfstage.bin"), "wb") as f:
+    f.write(bytes(4 * 4096))
+type_line("~x fake.lfu -2")
+wait_for(err, "sent fake.lfu", 60)
+wait_for(out, "ymodem: fake.lfu: staged in lfstage.bin, 3 blocks, read back and checked")
+time.sleep(0.5)
+with open(os.path.join(work, "lfstage.bin"), "rb") as f:
+    if f.read()[:len(pkg)] != pkg:
+        print("FAILED: lfstage.bin doesn't hold the package"); sys.exit(1)
+ok.append("~x FILE -2 stages a package in lfstage.bin; -1 refuses a package and -2 anything else")
+
 type_line("~x whole.fb4 -1")
 wait_for(err, "sent whole.fb4", 120)
 wait_for(out, "ymodem: whole.fb4: installed, %d blocks, read back and checked" % (len(image) // 4096))
@@ -298,7 +322,7 @@ ok.append("the port vanishing and coming back: kwai says so and carries on")
 
 type_line("~?")
 wait_for(err, "~x FILE")
-wait_for(err, "kwai 0.4, built ")
+wait_for(err, "kwai 0.5, built ")
 type_line("~q")
 kp.wait(timeout=5)
 ok.append("~? lists the commands and ~q quits")
