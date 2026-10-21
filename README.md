@@ -68,7 +68,7 @@ Lines that start with `~` are for kwai:
 |---|---|
 | `~x FILE` | Types `0 ymodem` on the board, then sends FILE (Forth source) by YMODEM into the blocks its `( BLOCK n )` lines name |
 | `~x FILE N` | Types `N ymodem`, then sends FILE (binary, such as a font) by YMODEM into blocks from byte 32 of block N |
-| `~x FILE -1` | Types `-1 ymodem`, then sends FILE, a whole block file (`lfblocks.fb4`, plain or sealed), to replace the board's. FILE must be whole 4 KB blocks starting with `LITEFORTH`, or nothing is typed |
+| `~x FILE -1` | Types `-1 ymodem`, then sends FILE, a whole block file (`lfblocks.fb4`), to replace the board's. FILE must be whole 4 KB blocks starting with `LITEFORTH`, or nothing is typed |
 | `~x FILE -2` | Types `-2 ymodem`, then sends FILE, a firmware update package (`sealblocks.py package`), into the board's `lfstage.bin`. FILE must be whole 4 KB blocks starting with `LITEFORTHF`, or nothing is typed (and `-1` refuses a package) |
 | `~s FILE` | Sends FILE by YMODEM to a receiver that is already waiting |
 | `~f FILE` | Sends FILE's lines as if typed, each after the last one's `ok>`; stops at an error |
