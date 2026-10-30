@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <sys/ioctl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <errno.h>
@@ -257,7 +258,7 @@ static int port_open(void) {
     dcb.fDsrSensitivity = FALSE;
     dcb.fOutX = FALSE;
     dcb.fInX = FALSE;
-    dcb.fDtrControl = DTR_CONTROL_ENABLE;
+    dcb.fDtrControl = DTR_CONTROL_DISABLE;  /* keep DTR low; raise it by hand after the purge */
     dcb.fRtsControl = RTS_CONTROL_ENABLE;
     if (!SetCommState(h, &dcb)) { CloseHandle(h); return -1; }
     COMMTIMEOUTS t;
@@ -267,8 +268,9 @@ static int port_open(void) {
     t.ReadTotalTimeoutConstant = 20;                /* byte up to 20 ms */
     t.WriteTotalTimeoutConstant = 2000;
     SetCommTimeouts(h, &t);
-    EscapeCommFunction(h, SETDTR);
-    PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
+    PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR); /* clear stale bytes while DTR is still low */
+    EscapeCommFunction(h, SETDTR);               /* raise DTR now: the board holds its output until
+                                                    this point, so its startup banner survives the purge */
     port = h;
     return 0;
 }
@@ -334,6 +336,8 @@ static speed_t baud_code(int baud) {
 static int port_open(void) {
     int fd = open(port_name, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
+    int dtr = TIOCM_DTR;
+    ioctl(fd, TIOCMBIC, &dtr);                      /* DTR low from the start: the board holds output */
     struct termios t;
     if (tcgetattr(fd, &t) < 0) { close(fd); return -1; }
     cfmakeraw(&t);
@@ -346,7 +350,8 @@ static int port_open(void) {
     cfsetispeed(&t, baud_code(port_baud));
     cfsetospeed(&t, baud_code(port_baud));
     if (tcsetattr(fd, TCSANOW, &t) < 0) { close(fd); return -1; }
-    tcflush(fd, TCIOFLUSH);
+    tcflush(fd, TCIOFLUSH);                         /* clear stale bytes while DTR is low */
+    ioctl(fd, TIOCMBIS, &dtr);                      /* raise DTR: the board's startup banner survives */
     port = fd;
     return 0;
 }
